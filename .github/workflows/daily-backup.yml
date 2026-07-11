@@ -1,0 +1,52 @@
+name: 每日备份 buckets 到私有 repo
+
+on:
+  schedule:
+    # 每天 UTC 19:00 = 北京时间凌晨 03:00 (避开活跃时段, 数据最稳定)
+    - cron: '0 19 * * *'
+  workflow_dispatch:  # 允许在 Actions 页面手动触发, 用于测试
+
+jobs:
+  trigger-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/backup
+        env:
+          BACKUP_URL: ${{ vars.OMBRE_BACKUP_URL }}
+          ADMIN_TOKEN: ${{ secrets.OMBRE_ADMIN_TOKEN }}
+        run: |
+          # 备份目标 URL 从 repo Variable 读, fork 用户必须自己在
+          # Settings > Secrets and variables > Actions > Variables
+          # 里设 OMBRE_BACKUP_URL = https://你的部署域名 (不带尾斜杠, 不带 /api/backup)
+          # 没设就跳过, 避免 fork 误备份到原作者实例
+          #
+          # 如果服务设了 OMBRE_ADMIN_TOKEN env, 则同时需要在 repo
+          # Settings > Secrets > Actions 里设 secret OMBRE_ADMIN_TOKEN
+          # 值跟服务端 OMBRE_ADMIN_TOKEN 一致, 否则 backup 会 401
+          if [ -z "$BACKUP_URL" ]; then
+            echo "::notice::OMBRE_BACKUP_URL not set; skipping backup."
+            echo "::notice::To enable: repo Settings > Variables > Actions > add OMBRE_BACKUP_URL"
+            exit 0
+          fi
+          AUTH_HEADER=()
+          if [ -n "$ADMIN_TOKEN" ]; then
+            AUTH_HEADER=(-H "X-Admin-Token: $ADMIN_TOKEN")
+          fi
+          response=$(curl -sS -w "\n__HTTP_STATUS__:%{http_code}" \
+            "${AUTH_HEADER[@]}" \
+            "${BACKUP_URL%/}/api/backup" \
+            --max-time 120 \
+            --retry 2 \
+            --retry-delay 30)
+          body=$(echo "$response" | sed -e 's/__HTTP_STATUS__:.*//' )
+          status=$(echo "$response" | grep -oE '__HTTP_STATUS__:[0-9]+' | cut -d: -f2)
+          echo "HTTP $status"
+          echo "$body"
+          if [ "$status" != "200" ]; then
+            echo "::error::Backup endpoint returned non-200"
+            exit 1
+          fi
+          if echo "$body" | grep -q '"ok":\s*false'; then
+            echo "::error::Backup reported failure"
+            exit 1
+          fi

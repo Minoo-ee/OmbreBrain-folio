@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!--
+    Ombre Brain favicon
+    左半实心 + 全圆描边 + 右半透明, 跟 brand mark (◐) 视觉一致
+    支持深色模式自动切色 (browser tab background 自适应)
+    比例: 圆 r=12 (canvas 32, ~75%) + stroke 3
+  -->
+  <style>
+    .ob-half { fill: #2a2438; }
+    .ob-ring { fill: none; stroke: #2a2438; stroke-width: 3; }
+    @media (prefers-color-scheme: dark) {
+      .ob-half { fill: #f5f0e6; }
+      .ob-ring { stroke: #f5f0e6; }
+    }
+  </style>
+  <path class="ob-half" d="M 16 4 A 12 12 0 0 0 16 28 Z"/>
+  <circle class="ob-ring" cx="16" cy="16" r="12"/>
+</svg>

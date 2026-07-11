@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+.claude/settings.local.json
+.claude/hooks/__pycache__/
+.vscode/
+config.yaml
+buckets/
+*.log
+server.log
+plan.md
+scarp_paper
+backup_*/
+*.db
+import_state.json
+AUDIT.md
+
+# 私密评测/候选数据 — 永不入库(仓是公开的!)
+tools/eval_set.json
+tools/eval_results_*.json
+tools/find_memory_*.md
+tools/enrich_candidates_*.jsonl
+tools/inject-feedback*.jsonl
+tools/eval_set_multi.json
+tools/eval_multiprobe_*.json

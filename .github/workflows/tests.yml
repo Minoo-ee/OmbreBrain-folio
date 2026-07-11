@@ -1,0 +1,37 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'backup_*/**'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run local tests (no API key needed)
+        run: python -m pytest tests/test_scoring.py tests/test_feel_flow.py -v --asyncio-mode=auto
+
+      - name: Run LLM quality tests
+        if: env.OMBRE_API_KEY != ''
+        env:
+          OMBRE_API_KEY: ${{ secrets.OMBRE_API_KEY }}
+        run: python -m pytest tests/test_llm_quality.py -v --asyncio-mode=auto

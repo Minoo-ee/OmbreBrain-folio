@@ -1,0 +1,65 @@
+# ============================================================
+# Render 一键部署配置
+# 点 README 里的 "Deploy to Render" 按钮会自动读这个文件
+# ============================================================
+
+services:
+  - type: web
+    name: ombre-brain
+    env: python
+    region: oregon  # 可选: oregon / frankfurt / singapore / ohio
+    plan: starter   # Starter ($7/mo) 付费层 — 免费层无持久盘会丢数据, 必须 Starter 或以上; standard 免冷启动
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+
+    # 持久磁盘 - 存 buckets/ + dehydration_cache.db + embedding 等
+    # ⚠ 不挂 disk 重启会丢数据
+    disk:
+      name: ombre-buckets
+      mountPath: /opt/render/project/src/buckets
+      sizeGB: 1  # 1GB 通常够用 (200 条记忆约 1MB)
+
+    envVars:
+      # ─── 系统级 (无需用户填) ───
+      - key: OMBRE_TRANSPORT
+        value: streamable-http
+      - key: OMBRE_BUCKETS_DIR
+        value: /opt/render/project/src/buckets
+
+      # ─── LLM 配置 (必填, 部署后到 Render dashboard > Environment 填) ───
+      - key: OMBRE_API_KEY
+        sync: false  # 任意 OpenAI 兼容 API key (DeepSeek / Gemini / Claude / etc.)
+      - key: OMBRE_BASE_URL
+        sync: false  # 例: https://api.deepseek.com/v1
+      - key: OMBRE_MODEL
+        sync: false  # 例: deepseek-chat
+
+      # ─── Embedding (可选, 给"全库相似"等高级功能用) ───
+      # 推荐 Gemini gemini-embedding-001 (3072 维, 与默认一致; 换模型在 config.yaml 的 embedding.model 改)
+      - key: OMBRE_EMBED_API_KEY
+        sync: false
+      - key: OMBRE_EMBED_BASE_URL
+        sync: false
+
+      # ─── 🔑 管理员 token (全局鉴权, Render 自动生成, 你啥都不用填) ───
+      # generateValue: Render 在首次部署时自动生成一个强随机值并固定下来。
+      # → 默认就是安全的, 不会裸奔, 也不用你自己想密码。
+      # 用网页 dashboard / 接 claude.ai 时, 到 Dashboard > Environment 复制这个
+      # OMBRE_ADMIN_TOKEN 的值: 前端首次访问会弹窗让你粘贴; MCP 连接器配成
+      # X-Admin-Token header。没有它任何人都能读/删你的全部记忆。
+      - key: OMBRE_ADMIN_TOKEN
+        generateValue: true
+
+      # ─── CORS 允许的浏览器跨源 origin (可选, 逗号分隔, 默认仅同源) ───
+      - key: OMBRE_ALLOWED_ORIGINS
+        sync: false
+
+      # ─── 自动备份 (可选, 强烈推荐云部署用户配) ───
+      # 配置后 GitHub Actions 每天 03:00 北京时间自动推 buckets/ 到私人 git repo
+      # 持久盘事故时是救命稻草
+      - key: OMBRE_BACKUP_REPO
+        sync: false  # 例: github.com/yourname/my-ombre-backup (建一个空 private repo)
+      - key: OMBRE_BACKUP_TOKEN
+        sync: false  # GitHub Personal Access Token, 权限 repo
+      - key: OMBRE_BACKUP_USER
+        value: ombre-bot
