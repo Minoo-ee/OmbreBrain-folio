@@ -34,6 +34,7 @@ import shutil
 import atexit
 import time
 import uuid
+import asyncio
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -138,12 +139,19 @@ class BucketManager:
         # 活跃桶集内存缓存(对齐上游 2.5.0 性能): list_all(include_archive=False) 命中
         # 直接返回, 不再每次全库 os.walk + frontmatter 重解析(touch 涟漪/随机浮现/
         # 导入页每次都全扫, 几百桶时是数十秒级热点)。
-        # 失效策略: ①任何改变桶集合/元数据的写操作调 _invalidate_active_cache;
-        # ②touch/涟漪不清整表, 就地更新缓存条目; ③TTL 兜底(上游没有这层)——
-        # 桶是 Obsidian 可手编的 markdown, 外部直接改盘无法触发①, 最多 stale TTL 秒。
+        # 失效策略: ①内部写操作主动失效; ②touch/涟漪就地更新;
+        # ③按 path/mtime/size 轮询识别 Obsidian/Git/手工外部编辑。
         self._active_cache: "list[dict] | None" = None
-        self._active_cache_at: float = 0.0
-        self._ACTIVE_CACHE_TTL_S = 60.0
+        self._active_file_state: dict[str, tuple[int, int]] = {}
+        self._active_cache_lock = asyncio.Lock()
+        storage_cfg = config.get("storage", {}) or {}
+        try:
+            self.external_change_poll_seconds = max(
+                0.0, float(storage_cfg.get("external_change_poll_seconds", 1.0))
+            )
+        except (TypeError, ValueError):
+            self.external_change_poll_seconds = 1.0
+        self._last_file_state_check = 0.0
 
         # 最近搜索追溯 (ring buffer, 容量 20): 给前端"我这次发消息浮现了哪些"用。
         # 结构: deque([{ts, query, top: [{id, name, score, matched_in, title_hit}, ...]}, ...])
@@ -270,7 +278,7 @@ class BucketManager:
         """
         import re
         if cls._TOKEN_SPLIT_RE is None:
-            cls._TOKEN_SPLIT_RE = re.compile(r'[\s,。!?:;、《》「」"\'""''()()【】\[\]<>\.\!\?\:;,/\\\|·~`@#\$%\^&\*\+=\-_]+')
+            cls._TOKEN_SPLIT_RE = re.compile(r'''[\s,。！？!?:：;；、，《》「」"'()（）【】\[\]<>./\\|·~`@#$%^&*+=_-]+''')
         raw = cls._TOKEN_SPLIT_RE.split(query or "")
 
         try:
@@ -1216,7 +1224,7 @@ class BucketManager:
             self._update_active_cache_entry(bucket_id, {
                 "last_active": post["last_active"],
                 "activation_count": post["activation_count"],
-            })
+            }, file_path)
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -1268,7 +1276,7 @@ class BucketManager:
                     _atomic_write_text(file_path, frontmatter.dumps(post))
                     self._update_active_cache_entry(bucket["id"], {
                         "activation_count": post["activation_count"],
-                    })
+                    }, file_path)
                     rippled += 1
                 except Exception:
                     continue
@@ -1299,6 +1307,7 @@ class BucketManager:
         query_arousal: float = None,
         record_stats: bool = True,
         caller: str = "",
+        result_filter=None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -1454,6 +1463,18 @@ class BucketManager:
             )
         else:
             scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # 可见性规则必须在 limit 切片之前执行，否则高分但应排除的桶会
+        # 占满窗口，把真正结果挡在切片之外。
+        if result_filter is not None:
+            filtered = []
+            for bucket in scored:
+                try:
+                    if result_filter(bucket):
+                        filtered.append(bucket)
+                except Exception as e:
+                    logger.warning(f"Search result filter failed for {bucket.get('id', '?')}: {e}")
+            scored = filtered
 
         # record_stats=False (即时模拟 dry-run): 不记统计、不污染命中频次, 直接返回结果
         if not record_stats:
@@ -1687,8 +1708,43 @@ class BucketManager:
     def _invalidate_active_cache(self) -> None:
         """任何改变活跃桶集合/元数据的写操作后调用。(对齐上游 2.5.0 性能)"""
         self._active_cache = None
+        self._active_file_state = {}
+        self._last_file_state_check = 0.0
 
-    def _update_active_cache_entry(self, bucket_id: str, updates: dict) -> None:
+    def _refresh_cached_file_state(self, file_path: str) -> None:
+        """确认一次内部原地写入，避免被下一轮轮询误判成外部编辑。"""
+        if self._active_cache is None:
+            return
+        normalized = os.path.normcase(os.path.abspath(file_path))
+        try:
+            stat = os.stat(file_path)
+            self._active_file_state[normalized] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self._active_file_state.pop(normalized, None)
+        self._last_file_state_check = time.monotonic()
+
+    def _scan_active_file_state(self) -> dict[str, tuple[int, int]]:
+        """轻量读取所有活跃 Markdown 的 path/mtime/size 指纹。"""
+        state = {}
+        for dir_path in (self.permanent_dir, self.dynamic_dir, self.feel_dir):
+            if not os.path.exists(dir_path):
+                continue
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    file_path = os.path.join(root, filename)
+                    try:
+                        stat = os.stat(file_path)
+                    except OSError:
+                        continue
+                    state[os.path.normcase(os.path.abspath(file_path))] = (
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+        return state
+
+    def _update_active_cache_entry(self, bucket_id: str, updates: dict, file_path: str = "") -> None:
         """touch/时间涟漪就地更新缓存条目, 不清整表 — 否则每次 breath touch 都会
         把缓存打掉, 缓存形同虚设。(对齐上游 2.5.0)"""
         if self._active_cache is None:
@@ -1698,6 +1754,8 @@ class BucketManager:
                 meta = b.get("metadata")
                 if isinstance(meta, dict):
                     meta.update(updates)
+                if file_path:
+                    self._refresh_cached_file_state(file_path)
                 return
 
     async def list_all(self, include_archive: bool = False) -> list[dict]:
@@ -1705,40 +1763,56 @@ class BucketManager:
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
 
-        活跃集(include_archive=False)走内存缓存: 命中直接返回浅拷贝(调用方
-        sort/filter 不影响缓存, 但 dict 共享 — touch 就地更新对外可见, 有意)。
+        活跃集(include_archive=False)走内存缓存，并定期检查 Markdown 文件指纹；
+        只有 path/mtime/size 变化时才重新解析。
         """
-        if not include_archive:
-            if (self._active_cache is not None
-                    and (time.monotonic() - self._active_cache_at) < self._ACTIVE_CACHE_TTL_S):
-                # 逐桶拷贝(dict 一层 + metadata 一层): search() 会往结果上盖
-                # score/matched_in 等每查询字段, 共享 dict 会把这些污染进缓存。
-                # content 字符串不可变, 共享无害。
-                return [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
-
-        buckets = []
-
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
             dirs.append(self.archive_dir)
 
-        for dir_path in dirs:
-            if not os.path.exists(dir_path):
-                continue
-            for root, _, files in os.walk(dir_path):
-                for filename in files:
-                    if not filename.endswith(".md"):
-                        continue
-                    file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
-                    if bucket:
-                        buckets.append(bucket)
+        if include_archive:
+            buckets = []
+            for dir_path in dirs:
+                if not os.path.exists(dir_path):
+                    continue
+                for root, _, files in os.walk(dir_path):
+                    for filename in files:
+                        if filename.endswith(".md"):
+                            bucket = self._load_bucket(os.path.join(root, filename))
+                            if bucket:
+                                buckets.append(bucket)
+            return buckets
 
-        if not include_archive:
+        async with self._active_cache_lock:
+            now = time.monotonic()
+            if self._active_cache is not None:
+                poll_due = (
+                    self.external_change_poll_seconds == 0
+                    or now - self._last_file_state_check >= self.external_change_poll_seconds
+                )
+                if not poll_due:
+                    return [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
+                current_state = self._scan_active_file_state()
+                self._last_file_state_check = now
+                if current_state == self._active_file_state:
+                    return [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
+                logger.info("External Markdown changes detected; rebuilding active bucket cache")
+
+            buckets = []
+            for dir_path in dirs:
+                if not os.path.exists(dir_path):
+                    continue
+                for root, _, files in os.walk(dir_path):
+                    for filename in files:
+                        if filename.endswith(".md"):
+                            bucket = self._load_bucket(os.path.join(root, filename))
+                            if bucket:
+                                buckets.append(bucket)
+
             self._active_cache = list(buckets)
-            self._active_cache_at = time.monotonic()
-
-        return buckets
+            self._active_file_state = self._scan_active_file_state()
+            self._last_file_state_check = time.monotonic()
+            return buckets
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)

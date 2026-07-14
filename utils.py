@@ -20,7 +20,19 @@ from pathlib import Path
 from datetime import datetime, date, timezone
 
 
-def atomic_write_text(path: str, text: str) -> None:
+def _win_long_path(path: str | Path) -> str:
+    """Windows 上添加长路径前缀；其他平台原样返回。"""
+    if os.name != "nt":
+        return str(path)
+    resolved = os.path.abspath(str(path))
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved[2:]
+    return "\\\\?\\" + resolved
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
     """原子写文本: 写临时文件 → fsync → os.replace 就位。(对齐上游 2.5.0 记忆安全)
 
     记忆桶是最不能丢的东西。普通 open("w") 写到一半被杀/断电/磁盘写满, 会把文件
@@ -32,17 +44,20 @@ def atomic_write_text(path: str, text: str) -> None:
     PermissionError(截断式写入反而能过) — 短重试 3 次, 仍失败则抛错。
     绝不回退成截断式写入: 报错可重试, 半截文件才是不可挽回的。
     """
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    target = Path(path)
+    directory = target.parent
+    os.makedirs(_win_long_path(directory), exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+    tmp_long = _win_long_path(tmp)
+    target_long = _win_long_path(target)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp_long, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         for attempt in range(3):
             try:
-                os.replace(tmp, path)
+                os.replace(tmp_long, target_long)
                 break
             except PermissionError:
                 if attempt == 2:
@@ -50,8 +65,8 @@ def atomic_write_text(path: str, text: str) -> None:
                 time.sleep(0.05)
     except Exception:
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            if os.path.exists(tmp_long):
+                os.remove(tmp_long)
         except OSError:
             pass
         raise
@@ -219,6 +234,9 @@ def load_config(config_path: str = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        "storage": {
+            "external_change_poll_seconds": 1.0,
+        },
     }
 
     # --- Load user config from YAML file ---
@@ -279,6 +297,18 @@ def load_config(config_path: str = None) -> dict:
     env_buckets_dir = os.environ.get("OMBRE_BUCKETS_DIR", "")
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
+
+    env_external_poll = os.environ.get("OMBRE_EXTERNAL_CHANGE_POLL_SECONDS", "").strip()
+    if env_external_poll:
+        try:
+            config.setdefault("storage", {})["external_change_poll_seconds"] = max(
+                0.0, float(env_external_poll)
+            )
+        except ValueError:
+            logging.warning(
+                "Invalid OMBRE_EXTERNAL_CHANGE_POLL_SECONDS=%r; using configured default",
+                env_external_poll,
+            )
 
     # auto_merge 开关 — OMBRE_AUTO_MERGE=false 关闭相似桶自动合并(默认 True = 上游行为不变)
     env_auto_merge = os.environ.get("OMBRE_AUTO_MERGE", "")

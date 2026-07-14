@@ -101,9 +101,25 @@ class EmbeddingEngine:
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        """Treat registry aliases such as ``bge-m3`` and ``bge-m3:latest`` equally."""
+        normalized = (model or "").strip().lower()
+        return normalized[:-7] if normalized.endswith(":latest") else normalized
+
+    def _model_identity(self) -> str:
+        return f"{(self.base_url or '').rstrip('/')}|{self._normalize_model_name(self.model)}"
+
     def _model_matches(self, stored_model: str) -> bool:
-        """空值(老库)按 _LEGACY_MODEL 归属; 只有与当前模型一致的向量才可用。"""
-        return (stored_model or self._LEGACY_MODEL) == self.model
+        """兼容老库模型名；新写入同时绑定 endpoint，避免跨供应商混算。"""
+        stored = stored_model or self._LEGACY_MODEL
+        if "|" in stored:
+            stored_base, stored_name = stored.rsplit("|", 1)
+            return (
+                stored_base.rstrip("/") == (self.base_url or "").rstrip("/")
+                and self._normalize_model_name(stored_name) == self._normalize_model_name(self.model)
+            )
+        return self._normalize_model_name(stored) == self._normalize_model_name(self.model)
 
     def _query_text(self, query: str) -> str:
         """查询侧文本预处理 — Qwen3-Embedding 系官方用法: 查询要带 instruction
@@ -141,7 +157,7 @@ class EmbeddingEngine:
         # Truncate to avoid token limits
         truncated = text[:2000]
         # LRU 命中: 同一模型同一文本的向量恒定, 不再重打 API(对齐上游 2.4.13)
-        cache_key = f"{self.model}:{truncated}"
+        cache_key = f"{self._model_identity()}:{truncated}"
         cached = self._embed_cache.get(cache_key)
         if cached is not None:
             self._embed_cache.move_to_end(cache_key)
@@ -169,7 +185,7 @@ class EmbeddingEngine:
         conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at, model) VALUES (?, ?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso(), self.model),
+            (bucket_id, json.dumps(embedding), now_iso(), self._model_identity()),
         )
         conn.commit()
         conn.close()

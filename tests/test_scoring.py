@@ -108,18 +108,16 @@ class TestTimeWeight:
 class TestDecayScoreSpecial:
     """Verify special bucket type scoring."""
 
-    # 注: 历史上 permanent/pinned/protected 的特殊分硬编为 999.0,
-    # 后来发现"太极端"(浮现池里完全压制其它桶), 改为 100.0
-    # (decay_engine.DEFAULTS.protected_score). test 跟着调.
+    # permanent/pinned/protected 使用 protected_score=999，表达永不衰减。
 
-    def test_permanent_is_100(self, decay_eng):
-        assert decay_eng.calculate_score({"type": "permanent"}) == 100.0
+    def test_permanent_uses_protected_score(self, decay_eng):
+        assert decay_eng.calculate_score({"type": "permanent"}) == 999.0
 
-    def test_pinned_is_100(self, decay_eng):
-        assert decay_eng.calculate_score({"pinned": True}) == 100.0
+    def test_pinned_uses_protected_score(self, decay_eng):
+        assert decay_eng.calculate_score({"pinned": True}) == 999.0
 
-    def test_protected_is_100(self, decay_eng):
-        assert decay_eng.calculate_score({"protected": True}) == 100.0
+    def test_protected_uses_protected_score(self, decay_eng):
+        assert decay_eng.calculate_score({"protected": True}) == 999.0
 
     def test_feel_is_50(self, decay_eng):
         assert decay_eng.calculate_score({"type": "feel"}) == 50.0

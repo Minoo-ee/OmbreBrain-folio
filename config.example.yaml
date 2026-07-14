@@ -21,6 +21,11 @@ log_level: "INFO"
 # 保持默认则使用内置的 ./buckets/ 目录
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
 
+# --- External Markdown edits / 外部 Markdown 编辑 ---
+# Obsidian、Git 或手工改盘绕过服务写接口时，按 path/mtime/size 检查缓存。
+storage:
+  external_change_poll_seconds: 1.0  # 设为 0 表示每次读取都检查
+
 # --- Merge threshold / 桶合并阈值 ---
 # When storing a new memory, if similarity with an existing bucket exceeds
 # this value (0-100), merge instead of creating a new one

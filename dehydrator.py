@@ -270,7 +270,7 @@ _DEFAULT_PROMPTS = {
 }
 
 # --- Upstream prompts (P0luz/Ombre-Brain @ upstream/main) ---
-# 用户可以通过配置页「⇆ 对齐原作者版本」按钮一键切到这套
+# 用户可以通过配置页「⇆ 2026-04-19 上游基线」按钮一键切到这套
 # REDEHYDRATE / REGEN_CONTENT 在上游不存在(本项目独创功能), 不在此 dict
 # DEHYDRATE / MERGE / ANALYZE 跟我们的 default 字节级一致, 仍单列以便上游 prompt 演化时这里可独立追踪
 _UPSTREAM_PROMPTS = {
@@ -452,15 +452,28 @@ class Dehydrator:
                 content_hash TEXT PRIMARY KEY,
                 summary TEXT NOT NULL,
                 model TEXT NOT NULL,
+                source_hash TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        try:
+            conn.execute("ALTER TABLE dehydration_cache ADD COLUMN source_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
+    def _source_hash(self, content: str) -> str:
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _cache_key(self, content: str) -> str:
+        """缓存身份包含 API endpoint + model，切换 profile 后不会复用旧摘要。"""
+        identity = f"{(self.base_url or '').rstrip('/')}\0{(self.model or '').strip().lower()}\0{content}"
+        return hashlib.sha256(identity.encode()).hexdigest()
+
     def _get_cached_summary(self, content: str) -> str | None:
         """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._cache_key(content)
         conn = sqlite3.connect(self.cache_db_path)
         row = conn.execute(
             "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
@@ -471,20 +484,24 @@ class Dehydrator:
 
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._cache_key(content)
+        source_hash = self._source_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
+            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model, source_hash) VALUES (?, ?, ?, ?)",
+            (content_hash, summary, self.model, source_hash)
         )
         conn.commit()
         conn.close()
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._source_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.execute(
+            "DELETE FROM dehydration_cache WHERE source_hash = ? OR content_hash = ?",
+            (content_hash, content_hash),
+        )
         conn.commit()
         conn.close()
 

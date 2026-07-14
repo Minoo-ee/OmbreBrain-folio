@@ -2,6 +2,26 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-07-14 · 安全对齐批次二（正确性 / 数据安全）
+
+### 修复 / Fixed
+
+- 搜索可见性过滤移到 `limit` 切片之前，feel / noise / pinned / trash 不再挤占有效结果窗口；命中统计也只记录调用方实际可见的结果。
+- `hold()` 显式传入的 valence / arousal 优先于自动分析，合法的 `0.0` 不再被中和值覆盖；Feel 模式保留调用方 tags；grow 与合并路径同步修复 `0.0 or default`。
+- 完整 bucket ID 查询直接返回原文，不再调用脱水模型。
+- 脱水缓存绑定 base URL + model；embedding 新写入绑定 endpoint + model，并兼容 `bge-m3` / `bge-m3:latest` 别名。
+- 软删除统一移出活跃向量索引，恢复时自动补建；向量检索额外防御性排除 trash。
+- 活跃桶缓存改为每秒检查 path / mtime / size，Obsidian、Git 或手工改盘最多约 1 秒可见；可通过 `OMBRE_EXTERNAL_CHANGE_POLL_SECONDS` 调整。
+- Windows 原子写入增加长路径前缀，同时保留 PermissionError 短重试。
+- Git 备份只复制 Markdown 源数据，`runtime_config.json` 深度脱敏，排除 SQLite/缓存/日志，并生成逐文件 SHA256 manifest。
+- 配置 API 的字符串 `"false"` 不再被 `bool()` 误判为开启；搜索 limit 加硬上限。
+
+### 测试 / Tests
+
+- 新增 `pytest.ini`，异步测试统一使用 auto 模式；修正 protected score 的过期断言。
+- 新增离线回归：过滤前切片、外部编辑缓存、模型/endpoint 缓存隔离、备份脱敏与 manifest、显式零坐标、Feel tags、原文 ID 读取、软删除向量一致性。
+- 全仓结果：`82 passed, 7 skipped, 5 subtests passed`。
+
 ## 2026-07-10 · 上游对齐批次一（v2.3.19 → v2.5.3 修复类）
 
 从上游两条版本线（v2.4.x / v2.5.x）移植的修复与健壮性改动。功能类（OAuth、multi-owner、目录模式等）不在本批，另行评估。

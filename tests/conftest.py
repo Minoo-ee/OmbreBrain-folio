@@ -31,6 +31,8 @@ def test_config(tmp_path):
     return {
         "buckets_dir": buckets_dir,
         "matching": {"fuzzy_threshold": 50, "max_results": 10},
+        # Tests that rewrite Markdown directly need deterministic immediate polling.
+        "storage": {"external_change_poll_seconds": 0},
         "wikilink": {"enabled": False},
         "scoring_weights": {
             "topic_relevance": 4.0,

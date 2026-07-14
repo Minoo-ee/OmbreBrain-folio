@@ -258,7 +258,7 @@ function ConfigPage() {
       const d = await r.json();
       if (d.state) setPromptCfg(d.state);
       setPromptDraft({});
-      alert(`已对齐上游 ${(d.aligned || []).length} 个 prompt` +
+      alert(`已切换到 2026-04-19 上游基线 ${(d.aligned || []).length} 个 prompt` +
         (d.skipped && d.skipped.length ? ` · 跳过 ${d.skipped.length} 个独创 prompt` : ''));
     } catch (e) {
       alert('对齐失败: ' + e.message);
@@ -695,7 +695,7 @@ function ConfigPage() {
                 disabled={promptResetAllBusy}
                 style={{ fontSize: 11, padding: '3px 12px' }}
                 title="把上游 (P0luz/Ombre-Brain) 有的 prompt 全部切到上游版本"
-              >{promptResetAllBusy ? '⌛' : '⇆ 对齐原作者版本'}</button>
+              >{promptResetAllBusy ? '⌛' : '⇆ 2026-04-19 上游基线'}</button>
               <button
                 className="oc-btn oc-btn-ghost"
                 onClick={resetPromptAll}

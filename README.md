@@ -7,7 +7,7 @@ A long-term emotional memory system for AI assistants. Tags memories using Russe
 > ### 🌿 这是一个优化分支 (an optimized fork)
 > 本项目 fork 自 **[P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain)**（原作者），已获授权开源。
 >
-> **核心记忆机制（衰减公式 / 做梦 / feel / 记忆桶 / 情感权重）与原作者完全一致、未改动。** 我在其上做的是：① 全套新前端体验 ② 一批便利功能 ③ 检索/排序的命中精度优化（尤其中文场景）。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。
+> 本项目沿用原版的记忆桶、衰减、Dream、Feel 与情绪坐标等核心概念，但已经加入独立的数据字段、检索策略、生命周期行为和前端能力，**不等同于当前上游版本**。基线与逐项差异见 [CHANGES.md](./CHANGES.md)。
 >
 > **如果你不需要这些前端/便利功能，请直接支持[原作者的版本](https://github.com/P0luz/Ombre-Brain)。**
 >
@@ -767,9 +767,9 @@ sudo systemctl restart ombre-brain   # 示例
 
 ## 关于本 fork (About this fork)
 
-这是 [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) 的一个优化分支版本。**核心记忆机制（衰减公式 / 做梦 / feel / 记忆桶 / 情感权重）与原作者完全一致、未改动**；我主要做了前端体验、便利功能，以及检索/排序的命中精度优化（尤其中文）。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。已获得原作者授权开源。
+这是 [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) 的一个优化分支版本。它沿用原版的核心概念，但已经在字段、检索、记忆生命周期和前端能力上形成明确差异，不能视为当前上游的无修改镜像。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。已获得原作者授权开源。
 
-This is an optimized fork of the upstream. **The core memory mechanism (decay / dreaming / feel / bucket model / emotion weighting) is identical to upstream and unchanged** — my changes are the frontend experience, convenience features, and retrieval/ranking precision tuning (especially for Chinese). Every change is transparently listed in [CHANGES.md](./CHANGES.md). Open-sourced with the original author's permission.
+This is an optimized fork of the upstream. It preserves the original concepts, but now has explicit differences in metadata, retrieval, memory lifecycle, and frontend behavior; it is not an unchanged mirror of current upstream. Every change is transparently listed in [CHANGES.md](./CHANGES.md). Open-sourced with the original author's permission.
 
 本 fork 特有文档 / Fork-specific docs:
 

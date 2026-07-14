@@ -36,6 +36,7 @@ import time
 import random
 import logging
 import asyncio
+import re
 import httpx
 
 
@@ -50,7 +51,8 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, coerce_bool
+from backup_utils import build_backup_payload
 
 # 后台补账任务的强引用(防 GC 早收), 完成即自清
 _BG_TASKS: set = set()
@@ -254,6 +256,12 @@ async def dream_hook(request):
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
+def _emo_value(source: dict, key: str, default: float) -> float:
+    """读取情绪坐标；合法的 0.0 不能被当成缺失值。"""
+    value = source.get(key)
+    return float(value) if isinstance(value, (int, float)) else default
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -288,8 +296,8 @@ async def _merge_or_create(
         if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
             try:
                 merged = await dehydrator.merge(bucket["content"], content)
-                old_v = bucket["metadata"].get("valence") or 0.5
-                old_a = bucket["metadata"].get("arousal") or 0.3
+                old_v = _emo_value(bucket["metadata"], "valence", 0.5)
+                old_a = _emo_value(bucket["metadata"], "arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2) if 0 <= valence <= 1 else old_v
                 merged_arousal = round((old_a + arousal) / 2, 2) if 0 <= arousal <= 1 else old_a
                 update_kwargs = dict(
@@ -352,8 +360,16 @@ async def breath(
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
     await decay_engine.ensure_started()
-    max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_results = max(1, min(int(max_results), 50))
+    max_tokens = max(1, min(int(max_tokens), 20000))
+
+    # 完整 bucket ID 表示显式读取：直接返回原文，避免脱水造成延迟或细节损失。
+    # 已归档/已内化的记忆仍可显式读取；回收站内容必须先恢复。
+    raw_query = (query or "").strip()
+    if re.fullmatch(r"(?=.{12,64}$)[0-9a-fA-F-]+", raw_query):
+        bucket = await bucket_mgr.get(raw_query)
+        if bucket and (bucket.get("metadata") or {}).get("type") != "trashed":
+            return f"[bucket_id:{bucket['id']}]\n{strip_wikilinks(bucket.get('content', ''))}"
 
     # --- Feel retrieval: domain="feel" is a special channel ---
     # --- Feel 检索：domain="feel" 是独立入口 ---
@@ -555,13 +571,25 @@ async def breath(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
+    def _is_noise(meta):
+        return bool(meta.get("resolved", False) and meta.get("importance", 5) == 1)
+
+    def _keyword_result_allowed(bucket):
+        meta = bucket.get("metadata") or {}
+        return not (
+            is_internalized(meta)
+            or _is_noise(meta)
+            or meta.get("type") in ("feel", "trashed")
+        )
+
     try:
         matches = await bucket_mgr.search(
             query,
-            limit=max(max_results, 20),
+            limit=max_results,
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            result_filter=_keyword_result_allowed,
         )
     except Exception as e:
         logger.error(f"Search failed / 检索失败: {e}")
@@ -578,13 +606,6 @@ async def breath(
     #   - 用户精准搜索 "完整指南" / "互动指南" / "关系文档" 这类高重要度桶时, 几乎都是钉选状态
     #   - 全被排除 → 用户感受是"我的桶搜不到"
     # 搜索和浮现是两个独立 mode (返回字符串完全不同), 不会真"重复"; 搜索应当尊重用户 query 意图.
-    def _is_noise(meta):
-        return bool(meta.get("resolved", False) and meta.get("importance", 5) == 1)
-    matches = [b for b in matches
-               if not (is_internalized(b["metadata"])
-                       or _is_noise(b["metadata"])
-                       or b["metadata"].get("type") == "feel")]
-
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
@@ -601,7 +622,7 @@ async def breath(
                                    or is_highlighted(bucket["metadata"])
                                    or is_protected(bucket["metadata"])
                                    or _is_noise(bucket["metadata"])
-                                   or bucket["metadata"].get("type") == "feel"):
+                                   or bucket["metadata"].get("type") in ("feel", "trashed")):
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
@@ -725,6 +746,9 @@ async def hold(
     else:
         extra_tags = [t.strip() for t in str(tags).split(",") if t.strip()]
 
+    explicit_valence = float(valence) if isinstance(valence, (int, float)) and 0 <= valence <= 1 else None
+    explicit_arousal = float(arousal) if isinstance(arousal, (int, float)) and 0 <= arousal <= 1 else None
+
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
     if feel:
@@ -733,7 +757,7 @@ async def hold(
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
         bucket_id = await bucket_mgr.create(
             content=content,
-            tags=[],
+            tags=extra_tags,
             importance=5,
             domain=[],
             valence=feel_valence,
@@ -773,10 +797,8 @@ async def hold(
     domain = analysis.get("domain") or ["未分类"]
     if not isinstance(domain, list):
         domain = ["未分类"]
-    _v = analysis.get("valence")
-    valence = float(_v) if _v is not None else 0.5
-    _a = analysis.get("arousal")
-    arousal = float(_a) if _a is not None else 0.3
+    valence = explicit_valence if explicit_valence is not None else _emo_value(analysis, "valence", 0.5)
+    arousal = explicit_arousal if explicit_arousal is not None else _emo_value(analysis, "arousal", 0.3)
     _raw_tags = analysis.get("tags") or []
     auto_tags = _raw_tags if isinstance(_raw_tags, list) else []
     suggested_name = analysis.get("suggested_name", "")
@@ -852,13 +874,13 @@ async def grow(content: str, event_time: str = "") -> str:
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
             domain=analysis.get("domain") or ["未分类"],
-            valence=analysis.get("valence") or 0.5,
-            arousal=analysis.get("arousal") or 0.3,
+            valence=_emo_value(analysis, "valence", 0.5),
+            arousal=_emo_value(analysis, "arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
         )
         action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(str(d) for d in (analysis.get('domain') or []) if d is not None)} V{float(analysis.get('valence') or 0.5):.1f}/A{float(analysis.get('arousal') or 0.3):.1f}"
+        return f"{action} → {result_name} | {','.join(str(d) for d in (analysis.get('domain') or []) if d is not None)} V{_emo_value(analysis, 'valence', 0.5):.1f}/A{_emo_value(analysis, 'arousal', 0.3):.1f}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
@@ -882,8 +904,8 @@ async def grow(content: str, event_time: str = "") -> str:
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
             domain=analysis.get("domain") or ["未分类"],
-            valence=analysis.get("valence") or 0.5,
-            arousal=analysis.get("arousal") or 0.3,
+            valence=_emo_value(analysis, "valence", 0.5),
+            arousal=_emo_value(analysis, "arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
         )
@@ -969,9 +991,12 @@ async def trace(
     # --- Delete mode / 删除模式 ---
     if delete:
         success = await bucket_mgr.delete(bucket_id)
-        if success:
-            embedding_engine.delete_embedding(bucket_id)
-        return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
+        if success and embedding_engine:
+            try:
+                embedding_engine.delete_embedding(bucket_id)
+            except Exception:
+                pass
+        return f"已移入回收站: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
 
     # --- Collect only fields actually passed / 只收集用户实际传入的字段 ---
     updates = {}
@@ -1439,7 +1464,7 @@ _SCORING_SCHEMA = [
         "label": "正文检索权重",
         "type": "float",
         "min": 0, "max": 10, "step": 0.5,
-        "hint": "正文字段在检索里的权重(默认 1.0 对齐上游)。调高(如 3.0)让'正文里写过的内容'也能被搜到('我写过却搜不到'的解药); 太高可能让正文相似但主题不同的桶误命中",
+        "hint": "正文字段在检索里的权重(默认 1.0，保持本 fork 基线)。调高(如 3.0)让'正文里写过的内容'也能被搜到('我写过却搜不到'的解药); 太高可能让正文相似但主题不同的桶误命中",
     },
     {
         "key": "title_hit_bonus",
@@ -1922,7 +1947,7 @@ async def api_config_strategy_set(request):
         except (ValueError, TypeError):
             return JSONResponse({"error": "merge_threshold 必须是 0-100 整数"}, status_code=400)
     if "auto_merge" in body:
-        v = bool(body["auto_merge"])
+        v = coerce_bool(body["auto_merge"], default=bool(config.get("auto_merge", True)))
         strategy["auto_merge"] = v
         config["auto_merge"] = v
     if "max_recall" in body:
@@ -2584,7 +2609,7 @@ async def api_bucket_merge_commit(request):
             "error": "B 已合并但 A 删除失败,需要手动清理",
             "b_id": b_id,
         }, status_code=500)
-    # 4) 顺手清掉 A 的 embedding
+    # 4) A 已离开活跃集，清掉派生向量；若用户恢复，restore 路径会重建。
     if embedding_engine:
         try:
             embedding_engine.delete_embedding(a_id)
@@ -2617,8 +2642,8 @@ async def api_bucket_archive(request):
 
 @mcp.custom_route("/api/bucket/{bucket_id}/delete", methods=["POST"])
 async def api_bucket_delete(request):
-    """软删除:移到回收站(可在 /v2/trash/ 恢复)。embedding 不动,搜索时
-    被 trash type 自然过滤。要真删调 /purge。"""
+    """软删除:移到回收站(可在 /v2/trash/ 恢复)，并移出活跃向量索引。
+    恢复时会自动重建 embedding；要真删调 /purge。"""
     from starlette.responses import JSONResponse
     bucket_id = request.path_params["bucket_id"]
     bucket = await bucket_mgr.get(bucket_id)
@@ -2627,6 +2652,11 @@ async def api_bucket_delete(request):
     success = await bucket_mgr.delete(bucket_id)
     if not success:
         return JSONResponse({"error": "delete failed"}, status_code=500)
+    if embedding_engine:
+        try:
+            embedding_engine.delete_embedding(bucket_id)
+        except Exception:
+            pass
     _invalidate_buckets_cache()
     return JSONResponse({"ok": True, "id": bucket_id, "soft_deleted": True})
 
@@ -2642,8 +2672,28 @@ async def api_bucket_restore(request):
     success = await bucket_mgr.restore(bucket_id)
     if not success:
         return JSONResponse({"error": "restore failed (可能不在回收站)"}, status_code=400)
+    # 恢复先立即返回；向量补建放后台，避免 provider 超时卡住回收站 UI。
+    embedding_queued = False
+    if embedding_engine and embedding_engine.enabled:
+        async def _refresh_restored_embedding(restored_id=bucket_id):
+            try:
+                restored = await bucket_mgr.get(restored_id)
+                if restored and await embedding_engine.get_embedding(restored_id) is None:
+                    await embedding_engine.generate_and_store(restored_id, restored.get("content", ""))
+            except Exception as e:
+                logger.warning(f"restore embedding refresh failed: {restored_id}: {e}")
+
+        task = asyncio.create_task(_refresh_restored_embedding())
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+        embedding_queued = True
     _invalidate_buckets_cache()
-    return JSONResponse({"ok": True, "id": bucket_id, "restored": True})
+    return JSONResponse({
+        "ok": True,
+        "id": bucket_id,
+        "restored": True,
+        "embedding_queued": embedding_queued,
+    })
 
 
 @mcp.custom_route("/api/bucket/{bucket_id}/purge", methods=["POST"])
@@ -3083,7 +3133,7 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        limit = int(request.query_params.get("limit", "20"))
+        limit = max(1, min(int(request.query_params.get("limit", "20")), 100))
     except ValueError:
         limit = 20
     # include_vector: 'false'(默认) / 'true'(总是跑) / 'fallback'(关键词优先、语义兜底 —
@@ -3115,18 +3165,30 @@ async def api_search(request):
     def _is_pinned(meta):
         return is_highlighted(meta) or is_protected(meta)
 
+    def _keyword_result_allowed(bucket):
+        meta = bucket.get("metadata") or {}
+        if meta.get("type") == "trashed":
+            return False
+        if not include_noise and _is_noise(meta):
+            return False
+        if not include_feel and _is_feel(meta):
+            return False
+        if exclude_pinned and _is_pinned(meta):
+            return False
+        return True
+
     # caller: 调用来源标注(auto-inject / eval / dashboard...), 进检索日志区分流量
     caller = (request.query_params.get("caller", "") or "")[:32]
 
     try:
         # === 关键词通道 ===
-        matches = await bucket_mgr.search(query, limit=limit, record_stats=not simulate, caller=caller)
-        if not include_noise:
-            matches = [b for b in matches if not _is_noise(b.get("metadata", {}))]
-        if not include_feel:
-            matches = [b for b in matches if not _is_feel(b.get("metadata", {}))]
-        if exclude_pinned:
-            matches = [b for b in matches if not _is_pinned(b.get("metadata", {}))]
+        matches = await bucket_mgr.search(
+            query,
+            limit=limit,
+            record_stats=not simulate,
+            caller=caller,
+            result_filter=_keyword_result_allowed,
+        )
         keyword_hits = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -3168,6 +3230,8 @@ async def api_search(request):
                     if not vb:
                         continue
                     vmeta = vb.get("metadata", {})
+                    if vmeta.get("type") == "trashed":
+                        continue
                     if not include_noise and _is_noise(vmeta):
                         continue
                     if not include_feel and _is_feel(vmeta):
@@ -3309,16 +3373,10 @@ async def api_backup(request):
             tmp = tempfile.mkdtemp(prefix="ombre-backup-")
             repo = porcelain.init(tmp)
 
-        # 2. 拷 buckets 全部内容
+        # 2. 构建安全载荷：只复制 Markdown；runtime_config 脱敏后另存。
+        # SQLite 派生索引、缓存、日志和明文凭据不进入 Git 历史。
+        payload = build_backup_payload(buckets_dir, tmp)
         backup_subdir = os.path.join(tmp, "buckets")
-        if os.path.exists(backup_subdir):
-            shutil.rmtree(backup_subdir)
-        shutil.copytree(buckets_dir, backup_subdir)
-
-        # 3. runtime_config.json (放外面, 跟 buckets/ 同级)
-        runtime_cfg = os.path.join(buckets_dir, "runtime_config.json")
-        if os.path.exists(runtime_cfg):
-            shutil.copy2(runtime_cfg, os.path.join(tmp, "runtime_config.json"))
 
         # 4. add 全部 (dulwich 需要相对路径)
         all_files = []
@@ -3335,10 +3393,7 @@ async def api_backup(request):
 
         # 5. commit; bucket 数 = 递归数所有 .md (因为 buckets/ 下面是 dynamic/permanent/feel 等子目录)
         ts = _dt.now().strftime("%Y-%m-%d %H:%M")
-        bucket_count = 0
-        if os.path.exists(backup_subdir):
-            for _root, _dirs, _files in os.walk(backup_subdir):
-                bucket_count += sum(1 for f in _files if f.endswith(".md"))
+        bucket_count = payload["bucket_count"]
         commit_msg = f"auto-backup {ts} ({bucket_count} buckets)".encode("utf-8")
         author = f"{user} <{user}@ombre-backup>".encode("utf-8")
         try:
@@ -3377,6 +3432,7 @@ async def api_backup(request):
             "bucket_count": bucket_count,
             "commit_message": commit_msg.decode("utf-8"),
             "commit_sha": commit_sha.decode("ascii") if isinstance(commit_sha, bytes) else str(commit_sha),
+            "manifest_sha256": payload["manifest_sha256"],
             "clone_status": clone_err if clone_err else "ok",
             "engine": "dulwich",
         })
