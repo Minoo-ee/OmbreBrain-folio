@@ -756,11 +756,6 @@ class ImportEngine:
                         event_time=item_event_time,
                         created_by="import",  # 跟 AI proactive 写入 (默认 'ai') 区分
                     )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(bucket_id, item["content"])
-                        except Exception:
-                            pass
                     # API 级 preserve_raw=1 时,raw_source 只能用 LLM 输出的 source_excerpt:
                     # - chunk content 会串入其他 items 对话(旧 bug)
                     # - item.content 是脱水后正文,伪装成原文反而误导用户
@@ -1044,11 +1039,6 @@ class ImportEngine:
                         valence=round((old_v + valence) / 2, 2),
                         arousal=round((old_a + arousal) / 2, 2),
                     )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(bucket["id"], merged)
-                        except Exception:
-                            pass
                     return True
                 except Exception as e:
                     logger.warning(f"Merge failed during import: {e}")
@@ -1078,11 +1068,6 @@ class ImportEngine:
                     source_excerpt=src_excerpt,
                     raw_source=src_excerpt,
                 )
-            except Exception:
-                pass
-        if self.embedding_engine:
-            try:
-                await self.embedding_engine.generate_and_store(bucket_id, content)
             except Exception:
                 pass
         return False

@@ -261,9 +261,9 @@ breath(query="今天很累")
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。`catalog=True` 返回省 token 的紧凑目录；有 query 时走关键词+向量语义双通道检索 / Surface or search memories; `catalog=True` returns a compact metadata-only index |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
-| `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
+| `grow` | 日记归档；可自动拆分长内容，也可用 `items=[...]` 逐字写入已拆好的多条正文 / Diary digest with automatic splitting or verbatim pre-split items |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
@@ -305,7 +305,7 @@ export OMBRE_API_KEY="your-api-key"
 Supports any OpenAI-compatible API. Just change `base_url` and `model` in `config.yaml`.
 
 > **💡 向量化检索（Embedding）**
-> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。每次 `hold`/`grow` 存入记忆时自动生成 embedding 并存入 `embeddings.db`（SQLite）。
+> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。`hold`/`grow` 会先把 Markdown 正文可靠落盘，再把 embedding 投递到耐久后台队列；供应商暂时不可用时会自动重试，不阻塞或回滚记忆写入。向量存入 `embeddings.db`（SQLite）。
 > 推荐：**Google AI Studio 的 `gemini-embedding-001`**（免费，1500 次/天，3072 维向量）。在 `config.yaml` 的 `embedding` 部分配置。
 > 不配置 embedding 也能用，系统会降级到纯 fuzzy matching 模式。
 >

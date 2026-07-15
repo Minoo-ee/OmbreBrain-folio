@@ -72,6 +72,7 @@ class BucketManager:
         self.trash_dir = os.path.join(self.base_dir, "trash")  # 软删除目录(回收站),可 restore
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
+        self.embedding_outbox = None
 
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
@@ -181,6 +182,30 @@ class BucketManager:
         # 解决: 长 query 在 partial_ratio 下错乱 + 高 valence 桶被 warmth_boost 推得无关键词也排前。
         # 默认 False → 维持原 fuzzy 行为, 开源/上游兼容。
         self.precise_match_mode = coerce_bool(scoring.get("precise_match_mode"), default=False)
+
+    def attach_embedding_outbox(self, outbox) -> None:
+        """Attach the durable derived-index queue after both objects exist."""
+        self.embedding_outbox = outbox
+
+    def _queue_embedding(self, bucket_id: str, content: str) -> None:
+        outbox = self.embedding_outbox
+        if outbox is None:
+            return
+        try:
+            outbox.enqueue(bucket_id, content)
+        except Exception as exc:
+            # Markdown has already been written. Never turn a derived-index
+            # failure into a lost/failed memory write.
+            logger.error("Failed to persist embedding outbox item for %s: %s", bucket_id, exc)
+
+    def _remove_embedding(self, bucket_id: str) -> None:
+        outbox = self.embedding_outbox
+        if outbox is None:
+            return
+        try:
+            outbox.remove(bucket_id)
+        except Exception as exc:
+            logger.warning("Failed to remove derived embedding for %s: %s", bucket_id, exc)
 
     # Runtime-tunable scoring keys (whitelist; values type-coerced per key).
     # 跟 decay_engine.DEFAULTS 同思路 — 限定可被 /api/scoring-config 改的 key, 防误写。
@@ -778,6 +803,7 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [" + " ".join(flag_tags) + "]" if flag_tags else "")
         )
+        self._queue_embedding(bucket_id, linked_content)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -1043,6 +1069,8 @@ class BucketManager:
 
         self._invalidate_active_cache()
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        if "content" in kwargs:
+            self._queue_embedding(bucket_id, post.content)
         return True
 
     # ---------------------------------------------------------
@@ -1093,6 +1121,7 @@ class BucketManager:
             return False
 
         self._invalidate_active_cache()
+        self._remove_embedding(bucket_id)
         logger.info(f"Soft-deleted bucket / 移到回收站: {bucket_id} → trash/{primary_domain}/")
         return True
 
@@ -1142,6 +1171,7 @@ class BucketManager:
             logger.error(f"Failed to restore bucket / 恢复桶失败: {bucket_id}: {e}")
             return False
         self._invalidate_active_cache()
+        self._queue_embedding(bucket_id, post.content)
         logger.info(f"Restored bucket / 从回收站恢复: {bucket_id} → {original_type}/{primary_domain}/")
         return True
 
@@ -1158,6 +1188,7 @@ class BucketManager:
             logger.error(f"Failed to purge bucket file / 物理删除桶失败: {file_path}: {e}")
             return False
         self._invalidate_active_cache()
+        self._remove_embedding(bucket_id)
         logger.info(f"Purged bucket / 物理删除记忆桶: {bucket_id}")
         return True
 
@@ -1758,6 +1789,22 @@ class BucketManager:
                     self._refresh_cached_file_state(file_path)
                 return
 
+    def _reconcile_external_embedding_changes(self, previous: list[dict], current: list[dict]) -> None:
+        """Mirror Obsidian/Git edits into the derived vector queue."""
+        if self.embedding_outbox is None:
+            return
+        old_by_id = {str(item.get("id") or ""): item for item in previous}
+        new_by_id = {str(item.get("id") or ""): item for item in current}
+        for bucket_id, bucket in new_by_id.items():
+            if not bucket_id:
+                continue
+            old = old_by_id.get(bucket_id)
+            if old is None or str(old.get("content") or "") != str(bucket.get("content") or ""):
+                self._queue_embedding(bucket_id, str(bucket.get("content") or ""))
+        for bucket_id in set(old_by_id) - set(new_by_id):
+            if bucket_id:
+                self._remove_embedding(bucket_id)
+
     async def list_all(self, include_archive: bool = False) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
@@ -1785,6 +1832,7 @@ class BucketManager:
 
         async with self._active_cache_lock:
             now = time.monotonic()
+            previous_cache = list(self._active_cache) if self._active_cache is not None else None
             if self._active_cache is not None:
                 poll_due = (
                     self.external_change_poll_seconds == 0
@@ -1812,6 +1860,8 @@ class BucketManager:
             self._active_cache = list(buckets)
             self._active_file_state = self._scan_active_file_state()
             self._last_file_state_check = time.monotonic()
+            if previous_cache is not None:
+                self._reconcile_external_embedding_changes(previous_cache, buckets)
             return buckets
 
     # ---------------------------------------------------------

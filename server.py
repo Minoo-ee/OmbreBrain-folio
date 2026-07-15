@@ -50,6 +50,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
+from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, coerce_bool
 from backup_utils import build_backup_payload
@@ -67,6 +68,8 @@ bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
+embedding_outbox = EmbeddingOutbox(config, bucket_mgr, embedding_engine)
+bucket_mgr.attach_embedding_outbox(embedding_outbox)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 from families import FamilyManager
 family_mgr = FamilyManager(bucket_mgr.base_dir, embedding_engine, bucket_mgr, dehydrator)  # 记忆家族/归纳层
@@ -104,11 +107,13 @@ mcp = FastMCP(
 async def health_check(request):
     from starlette.responses import JSONResponse
     try:
+        embedding_outbox.ensure_started()
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "embedding_outbox": embedding_outbox.status(),
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -262,6 +267,35 @@ def _emo_value(source: dict, key: str, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+async def _analyze_with_fallback(content: str) -> dict:
+    """自动打标失败时使用同一份中性默认值，保证正文仍然能落盘。"""
+    try:
+        return await dehydrator.analyze(content)
+    except Exception as e:
+        logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
+        return dehydrator._default_analysis()
+
+
+def _is_noise_meta(meta: dict) -> bool:
+    """已解决且重要度为 1 的桶是软隐藏噪声，不应出现在模型侧目录。"""
+    return bool(meta.get("resolved", False) and meta.get("importance", 5) == 1)
+
+
+def _configured_limit(name: str, default: int) -> int:
+    try:
+        return max(0, int((config.get("limits", {}) or {}).get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _payload_size_error(label: str, value: str, cap_name: str, default: int) -> str | None:
+    cap = _configured_limit(cap_name, default)
+    size = len(str(value or "").encode("utf-8"))
+    if cap and size > cap:
+        return f"{label}过大（{size / 1024:.1f} KB > 上限 {cap / 1024:.0f} KB），请分批调用。"
+    return None
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -271,6 +305,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     event_time: str = None,
+    raw_merge: bool = False,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -295,7 +330,14 @@ async def _merge_or_create(
         # --- 不合并到钉选/保护桶 ---
         if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
             try:
-                merged = await dehydrator.merge(bucket["content"], content)
+                if raw_merge:
+                    new_text = content.strip()
+                    if new_text and new_text in bucket["content"]:
+                        # 客户端超时重试时不重复追加同一段原文。
+                        return bucket["metadata"].get("name", bucket["id"]), True
+                    merged = bucket["content"].rstrip() + "\n\n" + new_text
+                else:
+                    merged = await dehydrator.merge(bucket["content"], content)
                 old_v = _emo_value(bucket["metadata"], "valence", 0.5)
                 old_a = _emo_value(bucket["metadata"], "arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2) if 0 <= valence <= 1 else old_v
@@ -313,11 +355,6 @@ async def _merge_or_create(
                 if event_time is not None:
                     update_kwargs["event_time"] = event_time
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
-                # --- Update embedding after merge ---
-                try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception:
-                    pass
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
@@ -332,12 +369,72 @@ async def _merge_or_create(
         name=name or None,
         event_time=event_time,
     )
-    # --- Generate embedding for new bucket ---
-    try:
-        await embedding_engine.generate_and_store(bucket_id, content)
-    except Exception:
-        pass
     return bucket_id, False
+
+
+async def _surface_catalog(domain_filter: list | None = None, max_tokens: int = 10000) -> str:
+    """返回活跃记忆的紧凑目录；只读元数据，不调用 LLM 或向量服务。"""
+    try:
+        buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return f"获取记忆目录失败: {e}"
+
+    if not buckets:
+        return "记忆库为空。"
+
+    filters = [str(d).strip().lower() for d in domain_filter if str(d).strip()] if domain_filter else None
+    sections = [("permanent", "固化"), ("dynamic", "动态"), ("feel", "feel")]
+    grouped = {key: [] for key, _ in sections}
+    for bucket in buckets:
+        meta = bucket.get("metadata") or {}
+        bucket_type = meta.get("type")
+        if bucket_type == "trashed" or is_internalized(meta) or _is_noise_meta(meta):
+            continue
+        domains = [str(d) for d in (meta.get("domain") or []) if d]
+        if filters:
+            domain_names = [d.lower() for d in domains]
+            if not (any(d in filters for d in domain_names) or str(bucket_type or "").lower() in filters):
+                continue
+        try:
+            importance = int(meta.get("importance") or 0)
+        except (TypeError, ValueError):
+            importance = 0
+        name = meta.get("name") or bucket["id"]
+        pin_mark = "📌" if (is_protected(meta) or is_highlighted(meta)) else ""
+        line = f"{pin_mark}{name} | {','.join(domains) or '未分类'} | {importance}"
+        key = bucket_type if bucket_type in grouped else "dynamic"
+        grouped[key].append((importance, line))
+
+    total = sum(len(rows) for rows in grouped.values())
+    if total == 0:
+        return "没有匹配 domain 过滤的记忆桶。"
+
+    parts = [
+        f"=== 记忆目录（{total} 桶）===",
+        "先看目录定位，再 breath(query=...) 精准拉取正文。",
+    ]
+    token_used = count_tokens_approx("\n".join(parts))
+    listed = 0
+    truncated = False
+    for key, label in sections:
+        rows = grouped[key]
+        if not rows or truncated:
+            continue
+        rows.sort(key=lambda item: item[0], reverse=True)
+        heading = f"--- {label}（{len(rows)}）---"
+        parts.append(heading)
+        token_used += count_tokens_approx(heading)
+        for _, line in rows:
+            line_tokens = count_tokens_approx(line)
+            if token_used + line_tokens > max_tokens:
+                truncated = True
+                break
+            parts.append(line)
+            token_used += line_tokens
+            listed += 1
+    if truncated:
+        parts.append(f"（已截断：还有 {total - listed} 桶未列出——传 domain 过滤缩小范围，或调大 max_tokens）")
+    return "\n".join(parts)
 
 
 # =============================================================
@@ -357,11 +454,21 @@ async def breath(
     valence: float = -1,
     arousal: float = -1,
     max_results: int = 20,
+    catalog: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。catalog=True=目录模式,只返回名称|域|重要度,不调用LLM或向量服务。"""
+    embedding_outbox.ensure_started()
     await decay_engine.ensure_started()
     max_results = max(1, min(int(max_results), 50))
     max_tokens = max(1, min(int(max_tokens), 20000))
+
+    query_size_error = _payload_size_error("查询", query, "max_query_bytes", 16 * 1024)
+    if query_size_error:
+        return query_size_error
+
+    if catalog:
+        domain_filter = [d.strip() for d in domain.split(",") if d.strip()] if domain.strip() else None
+        return await _surface_catalog(domain_filter, max_tokens=max_tokens)
 
     # 完整 bucket ID 表示显式读取：直接返回原文，避免脱水造成延迟或细节损失。
     # 已归档/已内化的记忆仍可显式读取；回收站内容必须先恢复。
@@ -739,6 +846,9 @@ async def hold(
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+    content_size_error = _payload_size_error("单条记忆", content, "max_bucket_bytes", 50 * 1024)
+    if content_size_error:
+        return content_size_error + " 请改用 grow 拆分存入。"
 
     importance = max(1, min(10, importance))
     if isinstance(tags, list):
@@ -768,10 +878,6 @@ async def hold(
             # 但批量回写历史(记忆写入工作台)时, 没有它 feel 的时间会全挤在写入批次那一刻
             event_time=event_time or None,
         )
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
         # --- Mark source memory as internalized + store model's valence perspective ---
         # --- 标记源记忆为已内化 + 存储模型视角的 valence ---
         if source_bucket and source_bucket.strip():
@@ -820,10 +926,6 @@ async def hold(
             pinned=True,
             event_time=event_time,
         )
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
         return f"📌钉选→{bucket_id} {','.join(str(d) for d in domain if d is not None)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -847,12 +949,76 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str, event_time: str = "") -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=这篇日记记录的事件发生时间(YYYY-MM-DD 或 ISO),不传默认就是现在。整篇日记拆出的所有桶会共享这个 event_time(因为本来就是"那天发生的事")。"""
+async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。"""
     await decay_engine.ensure_started()
+
+    # 上层模型已有完整对话上下文时，让它预先拆分通常比内部二次摘要更准确。
+    # 每条只补元数据；正文逐字保存，合并时也仅追加，不交给 LLM 改写。
+    if isinstance(items, list) and items:
+        item_cap = _configured_limit("max_grow_items", 100)
+        if item_cap and len(items) > item_cap:
+            return f"grow items 过多（{len(items)} > 上限 {item_cap}），请分批调用。"
+        total_item_bytes = sum(
+            len(str(item if isinstance(item, str) else item.get("content", "") if isinstance(item, dict) else "").encode("utf-8"))
+            for item in items
+        )
+        total_cap = _configured_limit("max_grow_input_bytes", 2 * 1024 * 1024)
+        if total_cap and total_item_bytes > total_cap:
+            return f"grow items 正文总量过大（{total_item_bytes / 1024:.1f} KB > 上限 {total_cap / 1024:.0f} KB），请分批调用。"
+        clean = []
+        for item in items:
+            item_importance = None
+            if isinstance(item, str):
+                item_content = item.strip()
+            elif isinstance(item, dict):
+                item_content = str(item.get("content", "")).strip()
+                raw_importance = item.get("importance")
+                if isinstance(raw_importance, int) and 1 <= raw_importance <= 10:
+                    item_importance = raw_importance
+            else:
+                item_content = ""
+            if item_content:
+                item_size_error = _payload_size_error("单条记忆", item_content, "max_bucket_bytes", 50 * 1024)
+                if item_size_error:
+                    return item_size_error
+                clean.append((item_content, item_importance))
+        if not clean:
+            return "items 为空或都不合法，未创建任何桶。"
+
+        results = []
+        created = 0
+        merged = 0
+        for item_content, item_importance in clean:
+            try:
+                analysis = await _analyze_with_fallback(item_content)
+                result_name, is_merged = await _merge_or_create(
+                    content=item_content,
+                    tags=analysis.get("tags") or [],
+                    importance=item_importance if item_importance is not None else 5,
+                    domain=analysis.get("domain") or ["未分类"],
+                    valence=_emo_value(analysis, "valence", 0.5),
+                    arousal=_emo_value(analysis, "arousal", 0.3),
+                    name=analysis.get("suggested_name", ""),
+                    event_time=event_time or None,
+                    raw_merge=True,
+                )
+                if is_merged:
+                    results.append(f"📎{result_name}")
+                    merged += 1
+                else:
+                    results.append(f"📝{result_name}")
+                    created += 1
+            except Exception as e:
+                logger.warning(f"grow items 条目处理失败 / verbatim item failed: {e}")
+                results.append("⚠️")
+        return f"{len(clean)}条(预拆分·逐字)|新{created}合{merged}\n" + "\n".join(results)
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
+    grow_size_error = _payload_size_error("grow 输入", content, "max_grow_input_bytes", 2 * 1024 * 1024)
+    if grow_size_error:
+        return grow_size_error
 
     # --- Short content fast path: skip digest, use hold logic directly ---
     # --- 短内容快速路径：跳过 digest 拆分，直接走 hold 逻辑省一次 API ---
@@ -861,14 +1027,7 @@ async def grow(content: str, event_time: str = "") -> str:
     # Instead, run analyze + create directly.
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
-        try:
-            analysis = await dehydrator.analyze(content)
-        except Exception as e:
-            logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
-            analysis = {
-                "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
-                "tags": [], "suggested_name": "",
-            }
+        analysis = await _analyze_with_fallback(content)
         result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags") or [],
@@ -894,11 +1053,7 @@ async def grow(content: str, event_time: str = "") -> str:
     # 改为: 整段当一条记忆存下来, 至少不丢; 用户回看时还能再 redehydrate/拆。
     if not items:
         logger.warning("grow digest 为空, 整段存为单条记忆 (兜底防丢)")
-        try:
-            analysis = await dehydrator.analyze(content)
-        except Exception:
-            analysis = {"domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
-                        "tags": [], "suggested_name": ""}
+        analysis = await _analyze_with_fallback(content)
         result_name, _is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags") or [],
@@ -919,6 +1074,12 @@ async def grow(content: str, event_time: str = "") -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
+            item_size_error = _payload_size_error(
+                "单条记忆", item.get("content", ""), "max_bucket_bytes", 50 * 1024
+            )
+            if item_size_error:
+                results.append(f"⚠️{item.get('name', '?')}（{item_size_error}）")
+                continue
             result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
@@ -975,6 +1136,11 @@ async def trace(
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    if content:
+        content_size_error = _payload_size_error("单条记忆", content, "max_bucket_bytes", 50 * 1024)
+        if content_size_error:
+            return content_size_error
 
     # --- 闸门:用户手写的桶,AI 没权限改/删/归档 ---
     # --- created_by="user" 是 dashboard 新建桶时打的标记,代表"这是用户手写的事实",
@@ -1044,13 +1210,6 @@ async def trace(
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
         return f"修改失败: {bucket_id}"
-
-    # Re-generate embedding if content changed
-    if "content" in updates:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception:
-            pass
 
     changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
     if "content" in updates:
@@ -2126,13 +2285,6 @@ async def api_bucket_update(request):
         return JSONResponse({"error": "update failed"}, status_code=500)
     _invalidate_buckets_cache()
 
-    # content 改了顺手刷 embedding
-    if "content" in updates and embedding_engine and embedding_engine.enabled:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception:
-            pass
-
     fresh = await bucket_mgr.get(bucket_id)
     return JSONResponse({
         "ok": True,
@@ -2315,13 +2467,6 @@ async def api_bucket_redehydrate_commit(request):
     if not success:
         return JSONResponse({"error": "写回失败"}, status_code=500)
     _invalidate_buckets_cache()
-
-    # 正文变了 → 刷 embedding
-    if new_content is not None and embedding_engine and embedding_engine.enabled:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, new_content)
-        except Exception:
-            pass
 
     fresh = await bucket_mgr.get(bucket_id)
     return JSONResponse({
@@ -2596,13 +2741,7 @@ async def api_bucket_merge_commit(request):
     )
     if not update_ok:
         return JSONResponse({"error": "更新 B 失败"}, status_code=500)
-    # 2) B content 变了,刷 embedding
-    if embedding_engine and embedding_engine.enabled:
-        try:
-            await embedding_engine.generate_and_store(b_id, merged_content)
-        except Exception as e:
-            logger.warning(f"merge: B embedding refresh failed: {e}")
-    # 3) 删 A
+    # 2) 删 A；B 的向量已由 update() 投递后台补账。
     delete_ok = await bucket_mgr.delete(a_id)
     if not delete_ok:
         return JSONResponse({
@@ -2672,21 +2811,7 @@ async def api_bucket_restore(request):
     success = await bucket_mgr.restore(bucket_id)
     if not success:
         return JSONResponse({"error": "restore failed (可能不在回收站)"}, status_code=400)
-    # 恢复先立即返回；向量补建放后台，避免 provider 超时卡住回收站 UI。
-    embedding_queued = False
-    if embedding_engine and embedding_engine.enabled:
-        async def _refresh_restored_embedding(restored_id=bucket_id):
-            try:
-                restored = await bucket_mgr.get(restored_id)
-                if restored and await embedding_engine.get_embedding(restored_id) is None:
-                    await embedding_engine.generate_and_store(restored_id, restored.get("content", ""))
-            except Exception as e:
-                logger.warning(f"restore embedding refresh failed: {restored_id}: {e}")
-
-        task = asyncio.create_task(_refresh_restored_embedding())
-        _BG_TASKS.add(task)
-        task.add_done_callback(_BG_TASKS.discard)
-        embedding_queued = True
+    embedding_queued = embedding_outbox.is_pending(bucket_id)
     _invalidate_buckets_cache()
     return JSONResponse({
         "ok": True,
@@ -2919,54 +3044,33 @@ async def api_embeddings_diagnose(request):
         "total_buckets": len(all_buckets),
         "with_embedding": has_emb,
         "missing": len(all_buckets) - has_emb,
+        "outbox": embedding_outbox.status(),
     })
 
 
 @mcp.custom_route("/api/embeddings/backfill", methods=["POST"])
 async def api_embeddings_backfill(request):
-    """一键给所有缺 embedding 的桶补生成。轻量保护:env OMBRE_ADMIN_TOKEN 鉴权。
-    无 token 时拒绝(避免被滥用消耗 API 配额)。"""
+    """把缺失或过期向量投递到耐久后台队列；请求本身不等待供应商。"""
+    import hmac
     from starlette.responses import JSONResponse
     expected = os.environ.get("OMBRE_ADMIN_TOKEN", "")
     if not expected:
         return JSONResponse({"error": "OMBRE_ADMIN_TOKEN 未配置,拒绝运行"}, status_code=503)
-    token = request.query_params.get("token") or request.headers.get("X-Admin-Token", "")
-    if token != expected:
+    token = request.headers.get("X-Admin-Token", "")
+    if not token or not hmac.compare_digest(token, expected):
         return JSONResponse({"error": "invalid token"}, status_code=401)
     if not embedding_engine or not embedding_engine.enabled:
         return JSONResponse({"error": "embedding 未启用,检查 OMBRE_EMBED_API_KEY"}, status_code=400)
 
     all_buckets = await bucket_mgr.list_all(include_archive=False)
-    missing = []
-    for b in all_buckets:
-        if await embedding_engine.get_embedding(b["id"]) is None:
-            missing.append(b)
-
-    success = 0
-    failed = 0
-    skipped = 0
-    errors = []
-    for b in missing:
-        content = (b.get("content") or "").strip()
-        if not content:
-            skipped += 1
-            continue
-        try:
-            ok = await embedding_engine.generate_and_store(b["id"], content)
-            if ok: success += 1
-            else: failed += 1
-        except Exception as e:
-            failed += 1
-            errors.append(f"{b['id'][:12]}: {str(e)[:120]}")
-            if len(errors) > 5:
-                break  # 早停 — 大概率配置问题
+    queued = await embedding_outbox.reconcile(buckets=all_buckets, include_archive=False)
+    embedding_outbox.retry_now()
+    embedding_outbox.ensure_started()
     return JSONResponse({
-        "total_missing": len(missing),
-        "success": success,
-        "failed": failed,
-        "skipped_empty": skipped,
-        "errors": errors[:5],
-    })
+        "accepted": True,
+        "queued_now": queued,
+        "outbox": embedding_outbox.status(),
+    }, status_code=202)
 
 
 @mcp.custom_route("/api/bucket/{bucket_id}/similar", methods=["GET"])
@@ -3079,12 +3183,6 @@ async def api_bucket_create(request):
     if internalized:
         try:
             await bucket_mgr.update(bucket_id, internalized=True)
-        except Exception:
-            pass
-
-    if embedding_engine and embedding_engine.enabled:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
 

@@ -10,6 +10,7 @@ from backup_utils import build_backup_payload
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from embedding_engine import EmbeddingEngine
+from embedding_outbox import EmbeddingOutbox, content_hash
 
 
 def _config(tmp_path, **overrides):
@@ -229,3 +230,154 @@ async def test_tool_parameters_preserve_explicit_zero_and_feel_tags(tmp_path, mo
     assert await server.breath(query="abcdef123456") == "[bucket_id:abcdef123456]\nverbatim memory"
     assert await server.trace(bucket_id="abcdef123456", delete=True) == "已移入回收站: abcdef123456"
     assert fake_embedding.deleted == ["abcdef123456"]
+
+
+@pytest.mark.asyncio
+async def test_catalog_and_pre_split_grow_are_metadata_only_and_verbatim(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "server-buckets"))
+    sys.modules.pop("server", None)
+    server = importlib.import_module("server")
+
+    class FakeDecay:
+        async def ensure_started(self):
+            return None
+
+    class FakeBuckets:
+        async def list_all(self, include_archive=False):
+            assert include_archive is False
+            return [
+                {
+                    "id": "low",
+                    "content": "must not leak into catalog",
+                    "metadata": {"name": "low", "type": "dynamic", "domain": ["work"], "importance": 2},
+                },
+                {
+                    "id": "high",
+                    "content": "must not leak either",
+                    "metadata": {"name": "high", "type": "dynamic", "domain": ["work"], "importance": 9},
+                },
+                {
+                    "id": "hidden",
+                    "content": "hidden",
+                    "metadata": {"name": "hidden", "type": "dynamic", "domain": ["work"], "importance": 10, "internalized": True},
+                },
+            ]
+
+    class FakeDehydrator:
+        async def analyze(self, content):
+            return {
+                "domain": ["journal"],
+                "valence": 0.0,
+                "arousal": 0.0,
+                "tags": ["verbatim"],
+                "suggested_name": content[:4],
+            }
+
+        async def digest(self, content):
+            raise AssertionError("pre-split grow must not call digest")
+
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "bucket_mgr", FakeBuckets())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+
+    catalog = await server.breath(catalog=True, domain="WORK")
+    assert "must not leak" not in catalog
+    assert "hidden" not in catalog
+    assert catalog.index("high | work | 9") < catalog.index("low | work | 2")
+
+    calls = []
+
+    async def fake_merge_or_create(**kwargs):
+        calls.append(kwargs)
+        return kwargs["name"], False
+
+    monkeypatch.setattr(server, "_merge_or_create", fake_merge_or_create)
+    result = await server.grow(
+        content="this is ignored",
+        event_time="2026-07-01",
+        items=["  first exact body  ", {"content": "second exact body", "importance": 8}],
+    )
+    assert "2条(预拆分·逐字)|新2合0" in result
+    assert [call["content"] for call in calls] == ["first exact body", "second exact body"]
+    assert [call["importance"] for call in calls] == [5, 8]
+    assert all(call["raw_merge"] is True for call in calls)
+    assert all(call["event_time"] == "2026-07-01" for call in calls)
+    assert all(call["valence"] == 0.0 and call["arousal"] == 0.0 for call in calls)
+
+    call_count = len(calls)
+    too_many = await server.grow(items=["x"] * 101)
+    assert "items 过多" in too_many
+    assert len(calls) == call_count
+    assert "查询过大" in await server.breath(query="查" * 6000)
+
+
+@pytest.mark.asyncio
+async def test_embedding_outbox_is_durable_private_and_retries(tmp_path):
+    config = _config(
+        tmp_path,
+        embedding={
+            "enabled": True,
+            "background_indexing": False,
+            "retry_base_seconds": 0.01,
+            "retry_max_seconds": 0.02,
+        },
+    )
+    manager = BucketManager(config)
+
+    class FakeEngine:
+        enabled = True
+
+        def __init__(self):
+            self.fail = True
+            self.indexed = {}
+            self.deleted = []
+
+        async def generate_and_store(self, bucket_id, content):
+            if self.fail:
+                return False
+            self.indexed[bucket_id] = content_hash(content)
+            return True
+
+        def list_all_ids(self):
+            return list(self.indexed)
+
+        def list_content_hashes(self):
+            return dict(self.indexed)
+
+        def delete_embedding(self, bucket_id):
+            self.deleted.append(bucket_id)
+            self.indexed.pop(bucket_id, None)
+
+    engine = FakeEngine()
+    outbox = EmbeddingOutbox(config, manager, engine)
+    manager.attach_embedding_outbox(outbox)
+    secret_body = "a private exact memory that must not be copied into the queue"
+    bucket_id = await manager.create(
+        content=secret_body,
+        tags=[],
+        importance=5,
+        domain=["test"],
+        valence=0.5,
+        arousal=0.3,
+        name="queued memory",
+    )
+
+    assert outbox.is_pending(bucket_id)
+    queue_text = (tmp_path / ".embedding_outbox.json").read_text(encoding="utf-8")
+    assert secret_body not in queue_text
+    assert content_hash(secret_body) in queue_text
+
+    assert await outbox.process_once() is True
+    assert outbox.status()["retrying"] == 1
+
+    # A new process can recover the pending item from disk and finish it.
+    recovered = EmbeddingOutbox(config, manager, engine)
+    manager.attach_embedding_outbox(recovered)
+    recovered.retry_now()
+    engine.fail = False
+    assert await recovered.process_once() is True
+    assert recovered.status()["pending"] == 0
+    assert engine.indexed[bucket_id] == content_hash(secret_body)
+
+    assert await manager.delete(bucket_id) is True
+    assert bucket_id in engine.deleted

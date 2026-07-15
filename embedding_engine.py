@@ -14,6 +14,7 @@
 import os
 import json
 import math
+import hashlib
 import sqlite3
 import logging
 import asyncio
@@ -98,6 +99,10 @@ class EmbeddingEngine:
             conn.execute("ALTER TABLE embeddings ADD COLUMN model TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # 列已存在
+        try:
+            conn.execute("ALTER TABLE embeddings ADD COLUMN content_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
@@ -146,7 +151,7 @@ class EmbeddingEngine:
             embedding = await self._generate_embedding(content)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            self._store_embedding(bucket_id, embedding, content)
             return True
         except Exception as e:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
@@ -179,13 +184,20 @@ class EmbeddingEngine:
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
-    def _store_embedding(self, bucket_id: str, embedding: list[float]):
+    def _store_embedding(self, bucket_id: str, embedding: list[float], content: str = ""):
         """Store embedding in SQLite (带生成模型名)."""
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at, model) VALUES (?, ?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso(), self._model_identity()),
+            "INSERT OR REPLACE INTO embeddings "
+            "(bucket_id, embedding, updated_at, model, content_hash) VALUES (?, ?, ?, ?, ?)",
+            (
+                bucket_id,
+                json.dumps(embedding),
+                now_iso(),
+                self._model_identity(),
+                hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
+            ),
         )
         conn.commit()
         conn.close()
@@ -196,6 +208,24 @@ class EmbeddingEngine:
         conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
         conn.commit()
         conn.close()
+
+    def list_all_ids(self) -> list[str]:
+        """Return IDs indexed by the currently configured provider/model."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model FROM embeddings").fetchall()
+        conn.close()
+        return [bucket_id for bucket_id, model in rows if self._model_matches(model)]
+
+    def list_content_hashes(self) -> dict[str, str]:
+        """Return exact-content identities for current-model vectors."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model, content_hash FROM embeddings").fetchall()
+        conn.close()
+        return {
+            bucket_id: str(digest or "")
+            for bucket_id, model, digest in rows
+            if self._model_matches(model)
+        }
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         """Retrieve stored embedding for a bucket.
