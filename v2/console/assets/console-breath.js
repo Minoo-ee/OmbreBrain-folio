@@ -159,6 +159,8 @@ function ObxSimPanel({ results, query, onQueryChange, onSimulate, dirty, loading
   const err = results && results.error;
   const kw = (results && results.keyword_hits) || [];
   const vec = (results && results.vector_hits) || [];
+  const semanticDegraded = results && results.vector_status === 'degraded';
+  const semanticNotice = results && results.vector_notice;
   return (
     <div className="obx-sim-panel">
       <div className="obx-sim-hd">
@@ -178,6 +180,9 @@ function ObxSimPanel({ results, query, onQueryChange, onSimulate, dirty, loading
         </button>
       </div>
       {err && <div className="obx-sim-err">出错: {String(results.error)}</div>}
+      {semanticDegraded && (
+        <div className="obx-sim-err">语义检索已降级：{semanticNotice || '本次只展示关键词结果'}</div>
+      )}
       {!results && !loading && <ObxEmpty text="输入查询后点「模拟」，dry-run 不记统计" />}
       {results && !err && (
         <div className="obx-sim-results">

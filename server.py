@@ -52,7 +52,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, coerce_bool
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, atomic_update_config_yaml, coerce_bool
 from backup_utils import build_backup_payload
 
 # 后台补账任务的强引用(防 GC 早收), 完成即自清
@@ -446,8 +446,7 @@ async def _surface_catalog(domain_filter: list | None = None, max_tokens: int = 
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
-@mcp.tool()
-async def breath(
+async def _breath_impl(
     query: str = "",
     max_tokens: int = 10000,
     domain: str = "",
@@ -823,6 +822,62 @@ async def breath(
         return "未找到相关记忆。"
 
     return "\n---\n".join(results)
+
+
+@mcp.tool()
+async def breath() -> str:
+    """无参数日常浮现。刻意保持 0 参数，让 claude.ai 的按需工具加载能稳定选中。需要检索用 breath_search；目录、feel、情绪坐标和 token 预算等高级选项用 breath_advanced。"""
+    return await _breath_impl()
+
+
+@mcp.tool()
+async def breath_search(query: str, domain: str = "", max_results: int = 20) -> str:
+    """按关键词检索记忆；这是日常找过去内容的轻量入口。domain 可选逗号分隔，max_results 最大 50。"""
+    return await _breath_impl(query=query, domain=domain, max_results=max_results)
+
+
+@mcp.tool()
+async def breath_advanced(
+    query: str = "",
+    max_tokens: int = 10000,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = 20,
+    catalog: bool = False,
+) -> str:
+    """高级记忆读取：支持 catalog、feel/domain、情绪坐标、返回数量和 token 预算。"""
+    return await _breath_impl(
+        query=query,
+        max_tokens=max_tokens,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
+        max_results=max_results,
+        catalog=catalog,
+    )
+
+
+@mcp.tool()
+async def breath_legacy(
+    query: str = "",
+    max_tokens: int = 10000,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = 20,
+    catalog: bool = False,
+) -> str:
+    """旧版 breath 参数接口的兼容别名；新调用请使用 breath_search 或 breath_advanced。"""
+    return await breath_advanced(
+        query=query,
+        max_tokens=max_tokens,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
+        max_results=max_results,
+        catalog=catalog,
+    )
 
 
 # =============================================================
@@ -3317,10 +3372,13 @@ async def api_search(request):
         )
         run_vector = include_vector or (vector_fallback and not _kw_strong)
         vector_hits = []
-        if run_vector and embedding_engine is not None:
+        semantic_status = "not-requested" if not run_vector else "degraded"
+        semantic_notice = ""
+        if run_vector and embedding_engine is not None and embedding_engine.enabled:
             try:
                 kw_ids = {h["id"] for h in keyword_hits}
-                vec_results = await embedding_engine.search_similar(query, top_k=10)
+                vec_results = await embedding_engine.search_similar_strict(query, top_k=10)
+                semantic_status = "ok"
                 for bucket_id, similarity in vec_results:
                     if bucket_id in kw_ids:
                         continue  # 已在关键词命中里,不重复
@@ -3348,15 +3406,23 @@ async def api_search(request):
                     })
             except Exception as ve:
                 logger.warning(f"[/api/search] vector channel failed: {ve}")
+                semantic_status = "degraded"
+                semantic_notice = "语义索引暂不可用，本次仅使用关键词检索"
+        elif run_vector:
+            semantic_notice = "语义索引未启用，本次仅使用关键词检索"
 
-        return JSONResponse({
+        response = JSONResponse({
             "query": query,
             "keyword_hits": keyword_hits,
             "vector_hits": vector_hits,
             # 观测字段: fallback 调参用 — vector_ran=false 且 mode=fallback 说明关键词强命中兜住了
             "vector_mode": _iv_raw,
-            "vector_ran": bool(run_vector and embedding_engine is not None),
+            "vector_ran": semantic_status == "ok",
+            "vector_status": semantic_status,
+            "vector_notice": semantic_notice,
         })
+        response.headers["X-Semantic-Search"] = semantic_status
+        return response
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -3862,7 +3928,6 @@ async def api_config_get(request):
 async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
-    import yaml
     try:
         body = await request.json()
     except Exception:
@@ -3914,31 +3979,22 @@ async def api_config_update(request):
     if body.get("persist", False):
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
         try:
-            save_config = {}
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    save_config = yaml.safe_load(f) or {}
+            def _mutate_yaml(save_config):
+                if "dehydration" in body:
+                    sc_dehy = save_config.setdefault("dehydration", {})
+                    for key in ("model", "base_url", "max_tokens", "temperature"):
+                        if key in body["dehydration"]:
+                            sc_dehy[key] = body["dehydration"][key]
+                    # Never persist api_key to yaml (use env var)
+                if "embedding" in body:
+                    sc_emb = save_config.setdefault("embedding", {})
+                    for key in ("enabled", "model"):
+                        if key in body["embedding"]:
+                            sc_emb[key] = body["embedding"][key]
+                if "merge_threshold" in body:
+                    save_config["merge_threshold"] = int(body["merge_threshold"])
 
-            if "dehydration" in body:
-                sc_dehy = save_config.setdefault("dehydration", {})
-                for key in ("model", "base_url", "max_tokens", "temperature"):
-                    if key in body["dehydration"]:
-                        sc_dehy[key] = body["dehydration"][key]
-                # Never persist api_key to yaml (use env var)
-
-            if "embedding" in body:
-                sc_emb = save_config.setdefault("embedding", {})
-                for key in ("enabled", "model"):
-                    if key in body["embedding"]:
-                        sc_emb[key] = body["embedding"][key]
-
-            if "merge_threshold" in body:
-                save_config["merge_threshold"] = int(body["merge_threshold"])
-
-            atomic_write_text(
-                config_path,
-                yaml.dump(save_config, default_flow_style=False, allow_unicode=True),
-            )
+            atomic_update_config_yaml(_mutate_yaml, config_path)
             updated.append("persisted_to_yaml")
         except Exception as e:
             return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)

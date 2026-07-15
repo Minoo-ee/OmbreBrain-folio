@@ -4,7 +4,7 @@
 #
 # Tests the complete feel lifecycle:
 #   1. hold(content, feel=True) → creates feel bucket
-#   2. breath(domain="feel") → retrieves feel buckets by time
+#   2. breath_advanced(domain="feel") → retrieves feel buckets by time
 #   3. source_bucket marked as digested
 #   4. dream() → returns feel crystallization hints
 #   5. trace() → can modify/hide feel
@@ -144,11 +144,11 @@ class TestFeelLifecycle:
 
     @pytest.mark.asyncio
     async def test_breath_feel_channel_reachable_without_query(self, isolated_tools, monkeypatch):
-        """Regression: breath(domain='feel') with an EMPTY query must reach the
+        """Regression: breath_advanced(domain='feel') with an EMPTY query must reach the
         feel channel — not fall through to the empty-query surfacing branch.
 
         The feel branch ignores query content (it lists all feels by time), so the
-        natural call is breath(domain='feel') with no query. It used to sit AFTER
+        natural call is breath_advanced(domain='feel') with no query. It used to sit AFTER
         the empty-query surfacing guard, which returns early — making feel
         unreachable on that path: an empty query returned ordinary memories instead
         of feels. Feel retrieval needs no LLM, so this runs without an API key.
@@ -161,7 +161,7 @@ class TestFeelLifecycle:
         import server
         monkeypatch.setattr(server, "bucket_mgr", bm)
         monkeypatch.setattr(server, "decay_engine", de)
-        breath = getattr(server.breath, "fn", server.breath)
+        breath_advanced = getattr(server.breath_advanced, "fn", server.breath_advanced)
 
         await bm.create(
             content="今天修好了 feel 通道，心里很踏实。",
@@ -174,7 +174,7 @@ class TestFeelLifecycle:
             name="买牛奶", bucket_type="dynamic",
         )
 
-        out = await breath(query="", domain="feel")
+        out = await breath_advanced(query="", domain="feel")
 
         assert "=== 你留下的 feel ===" in out   # reached the feel channel, not surfacing
         assert "feel 通道" in out               # feel content present

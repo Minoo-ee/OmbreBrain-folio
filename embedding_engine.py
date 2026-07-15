@@ -21,6 +21,7 @@ import asyncio
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 from openai import AsyncOpenAI
 
 from utils import coerce_bool, positive_float
@@ -248,16 +249,19 @@ class EmbeddingEngine:
         Returns list of (bucket_id, similarity_score) sorted by score desc.
         搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
         """
-        if not self.enabled:
-            return []
-
         try:
-            query_embedding = await self._generate_embedding(self._query_text(query))
-            if not query_embedding:
-                return []
+            return await self.search_similar_strict(query, top_k=top_k)
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return []
+
+    async def search_similar_strict(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+        """Semantic search that exposes provider failures to diagnostic callers."""
+        if not self.enabled:
+            raise RuntimeError("embedding is disabled")
+        query_embedding = await self._generate_embedding(self._query_text(query))
+        if not query_embedding:
+            raise RuntimeError("embedding provider returned an empty query vector")
 
         # Load all embeddings from SQLite (只取当前模型的向量 — 跨模型不可混算)
         conn = sqlite3.connect(self.db_path)
@@ -267,20 +271,44 @@ class EmbeddingEngine:
         if not rows:
             return []
 
-        # Calculate cosine similarity
-        results = []
+        ordered_ids = []
+        scores: list[float | None] = []
+        vectors = []
+        vector_owners = []
+        query_dim = len(query_embedding)
         for bucket_id, emb_json, stored_model in rows:
             if not self._model_matches(stored_model):
                 continue
+            owner = len(ordered_ids)
+            ordered_ids.append(bucket_id)
+            scores.append(None)
             try:
                 stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, Exception):
+                if not isinstance(stored_embedding, list) or not stored_embedding:
+                    continue
+                stored_embedding = [float(value) for value in stored_embedding]
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
+            if len(stored_embedding) != query_dim:
+                scores[owner] = 0.0
+                continue
+            vectors.append(stored_embedding)
+            vector_owners.append(owner)
 
+        if vectors:
+            similarities = self._cosine_similarity_batch(query_embedding, vectors)
+            for owner, similarity in zip(vector_owners, similarities):
+                scores[owner] = float(similarity)
+
+        results = [
+            (bucket_id, score)
+            for bucket_id, score in zip(ordered_ids, scores)
+            if score is not None
+        ]
+
+        # Stable sort preserves SQLite row order for equal scores.
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        return results[:max(0, int(top_k))]
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -293,3 +321,17 @@ class EmbeddingEngine:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _cosine_similarity_batch(query: list[float], vectors: list[list[float]]) -> "np.ndarray":
+        """Calculate equally-sized cosine similarities in one NumPy matrix pass."""
+        query_array = np.asarray(query, dtype=np.float64)
+        matrix = np.asarray(vectors, dtype=np.float64)
+        dots = matrix @ query_array
+        denominator = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_array)
+        return np.divide(
+            dots,
+            denominator,
+            out=np.zeros_like(dots),
+            where=denominator != 0,
+        )

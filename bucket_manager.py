@@ -47,7 +47,7 @@ from rapidfuzz import fuzz
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, is_highlighted, is_protected, is_internalized
 from utils import atomic_write_text as _atomic_write_text
 from utils import sideline_stale_dest as _sideline_stale_dest
-from utils import parse_iso_datetime, days_since_iso, coerce_bool
+from utils import parse_iso_datetime, days_since_iso, coerce_bool, filesystem_turn
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -206,6 +206,10 @@ class BucketManager:
             outbox.remove(bucket_id)
         except Exception as exc:
             logger.warning("Failed to remove derived embedding for %s: %s", bucket_id, exc)
+
+    def _bucket_turn(self, bucket_id: str):
+        """Serialize read-modify-write operations for one Markdown bucket."""
+        return filesystem_turn(self.base_dir, f"bucket-{bucket_id}")
 
     # Runtime-tunable scoring keys (whitelist; values type-coerced per key).
     # 跟 decay_engine.DEFAULTS 同思路 — 限定可被 /api/scoring-config 改的 key, 防误写。
@@ -823,6 +827,37 @@ class BucketManager:
             return None
         return self._load_bucket(file_path)
 
+    def find_exact_content(self, content: str, domain_filter: list[str] | None = None) -> Optional[dict]:
+        """直接读活跃 Markdown 查逐字正文，供导入断点重试去重。"""
+        expected = str(content or "").strip()
+        filters = {
+            str(domain).strip().lower()
+            for domain in (domain_filter or [])
+            if str(domain).strip()
+        }
+        for directory in (self.permanent_dir, self.dynamic_dir, self.feel_dir):
+            if not os.path.exists(directory):
+                continue
+            for root, _, files in os.walk(directory):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    bucket = self._load_bucket(os.path.join(root, filename))
+                    if not bucket or str(bucket.get("content") or "").strip() != expected:
+                        continue
+                    metadata = bucket.get("metadata") or {}
+                    if metadata.get("type") == "trashed":
+                        continue
+                    domains = metadata.get("domain") or []
+                    if isinstance(domains, str):
+                        domains = [domains]
+                    if filters and not {
+                        str(domain).strip().lower() for domain in domains
+                    } & filters:
+                        continue
+                    return bucket
+        return None
+
     # ---------------------------------------------------------
     # Move bucket between directories
     # 在目录间移动桶文件
@@ -849,6 +884,10 @@ class BucketManager:
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._update_locked(bucket_id, **kwargs)
+
+    async def _update_locked(self, bucket_id: str, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
@@ -1089,6 +1128,10 @@ class BucketManager:
     # 删除桶
     # ---------------------------------------------------------
     async def delete(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._delete_locked(bucket_id)
+
+    async def _delete_locked(self, bucket_id: str) -> bool:
         """
         Soft-delete: 移到 trash/ 目录(可在回收站恢复),保留 metadata.original_type
         防止 restore 时丢失原本类型(permanent/dynamic/feel)。
@@ -1129,6 +1172,10 @@ class BucketManager:
     # Restore: 从回收站移回原 type 目录
     # ---------------------------------------------------------
     async def restore(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._restore_locked(bucket_id)
+
+    async def _restore_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1179,6 +1226,10 @@ class BucketManager:
     # Purge: 真物理删除(回收站里点"永久删除")
     # ---------------------------------------------------------
     async def purge(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._purge_locked(bucket_id)
+
+    async def _purge_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1235,6 +1286,10 @@ class BucketManager:
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str) -> None:
+        async with self._bucket_turn(bucket_id):
+            await self._touch_locked(bucket_id)
+
+    async def _touch_locked(self, bucket_id: str) -> None:
         """
         Update a bucket's last activation time and count.
         Also triggers time ripple: nearby memories get a slight activation boost.
@@ -1913,6 +1968,10 @@ class BucketManager:
     # 由衰减引擎调用，模拟"遗忘"
     # ---------------------------------------------------------
     async def archive(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._archive_locked(bucket_id)
+
+    async def _archive_locked(self, bucket_id: str) -> bool:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
@@ -1955,6 +2014,10 @@ class BucketManager:
     # 用户在 dashboard 误归档/想恢复活跃时调用
     # ---------------------------------------------------------
     async def unarchive(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._unarchive_locked(bucket_id)
+
+    async def _unarchive_locked(self, bucket_id: str) -> bool:
         """Move an archived bucket back into dynamic/, clear 'archived' type marker."""
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:

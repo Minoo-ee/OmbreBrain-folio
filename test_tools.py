@@ -13,7 +13,7 @@ setup_logging("INFO")
 
 # Must import after config is set, since server.py does module-level init
 # 必须在配置好后导入，因为 server.py 有模块级初始化
-from server import breath, hold, trace, pulse, grow
+from server import breath_search, breath_advanced, hold, trace, pulse, grow
 
 
 async def main():
@@ -61,7 +61,7 @@ async def main():
     # ===== breath =====
     print("=== [3/6] breath ===")
     try:
-        r = await breath(query="Python 编程", max_results=3)
+        r = await breath_search(query="Python 编程", max_results=3)
         print(f"  结果前80字: {r[:80]}...")
         assert "未找到" not in r
         print("  [OK]")
@@ -74,7 +74,7 @@ async def main():
     # ===== breath (emotion resonance / 情感共鸣) =====
     print("=== [3b/6] breath (情感共鸣检索) ===")
     try:
-        r = await breath(query="编程", domain="编程", valence=0.8, arousal=0.5)
+        r = await breath_advanced(query="编程", domain="编程", valence=0.8, arousal=0.5)
         print(f"  结果前80字: {r[:80]}...")
         print("  [OK]")
         passed += 1

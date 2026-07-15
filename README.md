@@ -239,7 +239,7 @@ Claude ←→ MCP Protocol ←→ server.py
 ### 检索架构 / Search Architecture
 
 ```
-breath(query="今天很累")
+breath_search(query="今天很累")
          │
     ┌────┴────┐
     │         │
@@ -257,11 +257,13 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-6 个 MCP 工具 / 6 MCP tools:
+8 个主要 MCP 工具（另有 `breath_legacy` 兼容旧调用） / 8 primary MCP tools plus a legacy alias:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。`catalog=True` 返回省 token 的紧凑目录；有 query 时走关键词+向量语义双通道检索 / Surface or search memories; `catalog=True` returns a compact metadata-only index |
+| `breath` | 无参数浮现记忆；保持零参数以提高 MCP 按需选工具的稳定性 / Zero-argument memory surfacing |
+| `breath_search` | 日常关键词检索，可选领域和结果数 / Everyday keyword search with optional domain and result limit |
+| `breath_advanced` | 紧凑目录、feel、情绪坐标及 token 预算等高级读取 / Catalog, feel, emotion coordinates, and token-budget controls |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档；可自动拆分长内容，也可用 `items=[...]` 逐字写入已拆好的多条正文 / Diary digest with automatic splitting or verbatim pre-split items |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
@@ -492,13 +494,13 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 - `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
 - `source_bucket` 指向被消化的记忆，会被标记为「已消化」→ 加速淡化到无限小，但不会被删除
 - Feel 不参与普通浮现、不衰减、不参与 dreaming
-- 用 `breath(domain="feel")` 读取之前的 feel
+- 用 `breath_advanced(domain="feel")` 读取之前的 feel
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
 1. breath()              — 睁眼，看有什么浮上来
 2. dream()               — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel") — 读之前的 feel
+3. breath_advanced(domain="feel") — 读之前的 feel
 4. 开始和用户说话
 ```
 

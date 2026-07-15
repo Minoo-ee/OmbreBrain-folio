@@ -29,6 +29,12 @@ from utils import count_tokens_approx, now_iso, clean_llm_json, atomic_write_tex
 
 logger = logging.getLogger("ombre_brain.import")
 
+_CHUNK_TARGET_TOKENS = 10000
+_CHUNK_OVERSIZE_RATIO = 1.5
+_EXTRACT_TOKEN_CEILING = int(_CHUNK_TARGET_TOKENS * _CHUNK_OVERSIZE_RATIO)
+_STATE_ERROR_MAX = 100
+_STATE_ERROR_PREVIEW = 300
+
 
 # ============================================================
 # Format Parsers — normalize any format to conversation turns
@@ -265,7 +271,7 @@ def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
 # 分窗 — 按对话轮次边界切为 ~10k token 窗口
 # ============================================================
 
-def chunk_turns(turns: list[dict], target_tokens: int = 10000) -> list[dict]:
+def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS) -> list[dict]:
     """
     Group conversation turns into chunks of ~target_tokens.
     Returns list of {content, timestamp_start, timestamp_end, turn_count}.
@@ -292,7 +298,7 @@ def chunk_turns(turns: list[dict], target_tokens: int = 10000) -> list[dict]:
         line_tokens = count_tokens_approx(line)
 
         # If single turn exceeds target, split it
-        if line_tokens > target_tokens * 1.5:
+        if line_tokens > target_tokens * _CHUNK_OVERSIZE_RATIO:
             # Flush current
             if current_lines:
                 chunks.append({
@@ -625,20 +631,31 @@ class ImportEngine:
             self.extract_prompt = base_prompt
 
         try:
-            source_hash = hashlib.sha256(raw_content.encode()).hexdigest()[:16]
+            # 文件名/格式会影响解析器选择，分块策略也会影响 processed 下标；全部纳入
+            # 断点身份，避免拿旧进度套到另一份切片上造成跳过或重复。
+            resume_identity = (
+                f"{Path(filename).suffix.lower()}\x00{_CHUNK_TARGET_TOKENS}\x00{raw_content}"
+            )
+            source_hash = hashlib.sha256(resume_identity.encode()).hexdigest()[:16]
 
             # Check for resume
             if resume and self.state.load() and self.state.can_resume:
                 if self.state.data["source_hash"] == source_hash:
-                    logger.info(f"Resuming import from chunk {self.state.data['processed']}/{self.state.data['total_chunks']}")
                     # Re-parse and re-chunk to get the same chunks
                     turns = detect_and_parse(raw_content, filename)
                     self._chunks = chunk_turns(turns)
-                    self.state.data["status"] = "running"
-                    self.state.save()
-                    return await self._process_chunks(preserve_raw)
+                    if len(self._chunks) == self.state.data["total_chunks"]:
+                        logger.info(f"Resuming import from chunk {self.state.data['processed']}/{self.state.data['total_chunks']}")
+                        self.state.data["status"] = "running"
+                        self.state.save()
+                        return await self._process_chunks(preserve_raw)
+                    logger.warning(
+                        "Resume chunk count changed; starting fresh import: state=%s recomputed=%s",
+                        self.state.data["total_chunks"],
+                        len(self._chunks),
+                    )
                 else:
-                    logger.warning("Source file changed, starting fresh import")
+                    logger.warning("Source file or parsing identity changed, starting fresh import")
 
             # Fresh import
             turns = detect_and_parse(raw_content, filename)
@@ -715,7 +732,10 @@ class ImportEngine:
             items = await self._extract_memories(content)
             self.state.data["api_calls"] += 1
         except Exception as e:
-            logger.warning(f"LLM extraction failed: {e}")
+            error_text = f"LLM extraction failed: {e}"
+            logger.warning(error_text)
+            if len(self.state.data["errors"]) < _STATE_ERROR_MAX:
+                self.state.data["errors"].append(error_text[:_STATE_ERROR_PREVIEW])
             self.state.data["api_calls"] += 1
 
         # 实时记录最近提取的几条,前端进度条展示用
@@ -743,6 +763,19 @@ class ImportEngine:
                 item_event_time = item.get("event_time") or chunk_event_time
 
                 if should_preserve:
+                    # 进度按整个 chunk 提交；若进程在 chunk 中途退出，恢复后会重跑
+                    # 已成功的前几条。逐字原文可用精确正文安全去重，避免复制一份。
+                    exact_finder = getattr(self.bucket_mgr, "find_exact_content", None)
+                    if callable(exact_finder):
+                        try:
+                            if exact_finder(
+                                item["content"],
+                                domain_filter=item.get("domain") or None,
+                            ):
+                                logger.info("Skipping already imported verbatim memory: %s", item.get("name", "?"))
+                                continue
+                        except Exception as duplicate_error:
+                            logger.warning("preserve_raw duplicate check failed: %s", duplicate_error)
                     # Raw mode: store original content without summarization
                     bucket_id = await self.bucket_mgr.create(
                         content=item["content"],
@@ -766,8 +799,11 @@ class ImportEngine:
                         if src_excerpt and src_excerpt.strip():
                             try:
                                 await self.bucket_mgr.update(bucket_id, raw_source=src_excerpt)
-                            except Exception:
-                                pass
+                            except Exception as source_error:
+                                error_text = f"Failed to attach raw source to {bucket_id}: {source_error}"
+                                logger.warning(error_text)
+                                if len(self.state.data["errors"]) < _STATE_ERROR_MAX:
+                                    self.state.data["errors"].append(error_text[:_STATE_ERROR_PREVIEW])
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
                 else:
@@ -779,7 +815,10 @@ class ImportEngine:
                         self.state.data["memories_created"] += 1
 
             except Exception as e:
-                logger.warning(f"Failed to store memory: {item.get('name', '?')}: {e}")
+                error_text = f"Failed to store memory {item.get('name', '?')!r}: {e}"
+                logger.warning(error_text)
+                if len(self.state.data["errors"]) < _STATE_ERROR_MAX:
+                    self.state.data["errors"].append(error_text[:_STATE_ERROR_PREVIEW])
 
     async def _extract_memories(self, chunk_content: str) -> list[dict]:
         """Use LLM to extract memories from a conversation chunk."""
@@ -796,11 +835,26 @@ class ImportEngine:
         self.state.data["debug_long_excerpt"] = self.long_excerpt
         self.state.data["debug_prompt_kind"] = prompt_kind
 
+        trimmed_content = chunk_content
+        total_tokens = count_tokens_approx(chunk_content)
+        if total_tokens > _EXTRACT_TOKEN_CEILING:
+            chars_per_token = len(chunk_content) / max(1, total_tokens)
+            keep_chars = max(1, int(_EXTRACT_TOKEN_CEILING * chars_per_token))
+            trimmed_content = chunk_content[:keep_chars]
+            warning = (
+                "Import chunk exceeded extraction token ceiling and was visibly truncated: "
+                f"{len(chunk_content)} chars (~{total_tokens} tokens) -> "
+                f"{len(trimmed_content)} chars (~{count_tokens_approx(trimmed_content)} tokens)"
+            )
+            logger.warning(warning)
+            if len(self.state.data["errors"]) < _STATE_ERROR_MAX:
+                self.state.data["errors"].append(warning[:_STATE_ERROR_PREVIEW])
+
         response = await self.dehydrator.client.chat.completions.create(
             model=self.dehydrator.model,
             messages=[
                 {"role": "system", "content": self.extract_prompt},
-                {"role": "user", "content": chunk_content[:12000]},
+                {"role": "user", "content": trimmed_content},
             ],
             max_tokens=16384,  # Sonnet 4.6 上限 64k,留足以防中途截断
             temperature=0.0,

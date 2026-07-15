@@ -1,16 +1,26 @@
+import asyncio
 import hashlib
 import importlib
+import inspect
 import json
+import os
+import sqlite3
 import sys
+import threading
+import time
+from types import SimpleNamespace
 
 import frontmatter
 import pytest
+import yaml
 
 from backup_utils import build_backup_payload
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from embedding_engine import EmbeddingEngine
 from embedding_outbox import EmbeddingOutbox, content_hash
+from import_memory import ImportEngine
+from utils import _win_long_path, atomic_update_config_yaml
 
 
 def _config(tmp_path, **overrides):
@@ -152,6 +162,243 @@ def test_backup_payload_excludes_databases_and_redacts_credentials(tmp_path):
     }
 
 
+def test_backup_payload_supports_deep_windows_paths(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    segment = "deep-domain-segment-" * 3
+    relative_parts = ["dynamic", segment, segment, segment, segment, "memory.md"]
+    deep_source = source.joinpath(*relative_parts)
+    os.makedirs(_win_long_path(deep_source.parent), exist_ok=True)
+    os.makedirs(_win_long_path(target), exist_ok=True)
+    with open(_win_long_path(deep_source), "w", encoding="utf-8") as handle:
+        handle.write("deep memory")
+
+    result = build_backup_payload(source, target)
+    deep_backup = target.joinpath("buckets", *relative_parts)
+    assert result["bucket_count"] == 1
+    assert os.path.exists(_win_long_path(deep_backup))
+    with open(_win_long_path(deep_backup), "r", encoding="utf-8") as handle:
+        assert handle.read() == "deep memory"
+
+
+@pytest.mark.asyncio
+async def test_same_bucket_mutations_are_serialized(tmp_path, monkeypatch):
+    manager = BucketManager(_config(tmp_path))
+    active = 0
+    max_active = 0
+
+    async def fake_update(bucket_id, **kwargs):
+        nonlocal active, max_active
+        assert bucket_id == "same-bucket"
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+        return True
+
+    monkeypatch.setattr(manager, "_update_locked", fake_update)
+    assert await asyncio.gather(
+        manager.update("same-bucket", content="one"),
+        manager.update("same-bucket", content="two"),
+    ) == [True, True]
+    assert max_active == 1
+
+
+def test_config_yaml_concurrent_updates_preserve_every_writer(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    barrier = threading.Barrier(8)
+    failures = []
+
+    def worker(index):
+        try:
+            barrier.wait()
+
+            def mutate(config):
+                time.sleep(0.01)
+                config[f"writer_{index}"] = index
+
+            atomic_update_config_yaml(mutate, config_path)
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert not any(thread.is_alive() for thread in threads)
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted == {f"writer_{index}": index for index in range(8)}
+
+
+@pytest.mark.asyncio
+async def test_numpy_vector_search_is_stable_and_handles_bad_dimensions(tmp_path, monkeypatch):
+    engine = EmbeddingEngine(_config(tmp_path))
+    engine.enabled = True
+
+    async def query_vector(_text):
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(engine, "_generate_embedding", query_vector)
+    rows = [
+        ("first", [1.0, 0.0]),
+        ("second", [2.0, 0.0]),
+        ("mismatch", [1.0, 0.0, 0.0]),
+        ("zero", [0.0, 0.0]),
+    ]
+    with sqlite3.connect(engine.db_path) as connection:
+        for bucket_id, vector in rows:
+            connection.execute(
+                "INSERT OR REPLACE INTO embeddings "
+                "(bucket_id, embedding, updated_at, model, content_hash) VALUES (?, ?, ?, ?, ?)",
+                (bucket_id, json.dumps(vector), "now", engine._model_identity(), "hash"),
+            )
+        connection.execute(
+            "INSERT OR REPLACE INTO embeddings "
+            "(bucket_id, embedding, updated_at, model, content_hash) VALUES (?, ?, ?, ?, ?)",
+            ("malformed", "not-json", "now", engine._model_identity(), "hash"),
+        )
+
+    results = await engine.search_similar_strict("query", top_k=10)
+    assert [bucket_id for bucket_id, _ in results[:2]] == ["first", "second"]
+    assert dict(results)["mismatch"] == 0.0
+    assert dict(results)["zero"] == 0.0
+    assert "malformed" not in dict(results)
+
+
+@pytest.mark.asyncio
+async def test_import_does_not_apply_old_character_cutoff_and_reports_failures(tmp_path, monkeypatch):
+    captured = []
+
+    class Completions:
+        async def create(self, **kwargs):
+            captured.append(kwargs["messages"][-1]["content"])
+            return SimpleNamespace(choices=[])
+
+    dehydrator = SimpleNamespace(
+        api_available=True,
+        model="test-model",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+    )
+    engine = ImportEngine(_config(tmp_path), SimpleNamespace(), dehydrator)
+
+    below_token_ceiling = "x" * 13000
+    await engine._extract_memories(below_token_ceiling)
+    assert captured[-1] == below_token_ceiling
+
+    over_token_ceiling = "记" * 11000
+    await engine._extract_memories(over_token_ceiling)
+    assert len(captured[-1]) < len(over_token_ceiling)
+    assert any("visibly truncated" in error for error in engine.state.data["errors"])
+
+    async def one_item(_content):
+        return [{"name": "broken", "content": "body"}]
+
+    async def fail_store(_item, event_time=None):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(engine, "_extract_memories", one_item)
+    monkeypatch.setattr(engine, "_merge_or_create_item", fail_store)
+    await engine._process_single_chunk({"content": "conversation"}, preserve_raw=False)
+    assert any("disk full" in error for error in engine.state.data["errors"])
+
+
+@pytest.mark.asyncio
+async def test_preserve_raw_import_retry_skips_exact_duplicate(tmp_path, monkeypatch):
+    manager = BucketManager(_config(tmp_path))
+    await manager.create(
+        content="exact imported body",
+        tags=["raw"],
+        importance=5,
+        domain=["journal"],
+        valence=0.5,
+        arousal=0.3,
+        name="existing raw",
+    )
+    engine = ImportEngine(_config(tmp_path), manager, SimpleNamespace())
+
+    async def repeated_item(_content):
+        return [{
+            "name": "same raw",
+            "content": "exact imported body",
+            "domain": ["journal"],
+            "preserve_raw": True,
+        }]
+
+    monkeypatch.setattr(engine, "_extract_memories", repeated_item)
+    await engine._process_single_chunk({"content": "replayed chunk"}, preserve_raw=True)
+    assert len(await manager.list_all()) == 1
+
+
+def test_poison_embedding_item_does_not_trip_global_circuit_by_itself(tmp_path):
+    config = _config(
+        tmp_path,
+        embedding={
+            "enabled": True,
+            "background_indexing": False,
+            "retry_base_seconds": 0.01,
+            "retry_max_seconds": 0.02,
+            "circuit_failure_threshold": 2,
+            "circuit_base_seconds": 5,
+            "circuit_max_seconds": 5,
+        },
+    )
+    outbox = EmbeddingOutbox(
+        config,
+        SimpleNamespace(),
+        SimpleNamespace(enabled=True),
+    )
+    first_digest = content_hash("poison")
+    outbox.enqueue("poison-bucket", "poison")
+    outbox._fail("poison-bucket", first_digest, "filtered")
+    outbox._fail("poison-bucket", first_digest, "filtered again")
+
+    circuit = outbox.status()["circuit"]
+    assert circuit["state"] == "closed"
+    assert circuit["consecutive_failures"] == 1
+
+    second_digest = content_hash("provider-wide failure")
+    outbox.enqueue("another-bucket", "provider-wide failure")
+    outbox._fail("another-bucket", second_digest, "also failed")
+    assert outbox.status()["circuit"]["state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_search_endpoint_reports_semantic_degradation(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "server-buckets"))
+    sys.modules.pop("server", None)
+    server = importlib.import_module("server")
+
+    class FakeBuckets:
+        async def search(self, *args, **kwargs):
+            return []
+
+    class BrokenEmbedding:
+        enabled = True
+
+        async def search_similar_strict(self, query, top_k=10):
+            raise RuntimeError("provider offline")
+
+    class Request:
+        query_params = {"q": "needle", "include_vector": "true"}
+
+    monkeypatch.setattr(server, "bucket_mgr", FakeBuckets())
+    monkeypatch.setattr(server, "embedding_engine", BrokenEmbedding())
+    monkeypatch.setattr(server, "_ensure_family_auto_rebuild", lambda: None)
+
+    response = await server.api_search(Request())
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body["keyword_hits"] == []
+    assert body["vector_hits"] == []
+    assert body["vector_status"] == "degraded"
+    assert body["vector_ran"] is False
+    assert body["vector_notice"]
+    assert response.headers["X-Semantic-Search"] == "degraded"
+
+
 @pytest.mark.asyncio
 async def test_tool_parameters_preserve_explicit_zero_and_feel_tags(tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "server-buckets"))
@@ -227,7 +474,8 @@ async def test_tool_parameters_preserve_explicit_zero_and_feel_tags(tmp_path, mo
     assert created[-1]["valence"] == 0.0
     assert created[-1]["arousal"] == 0.0
 
-    assert await server.breath(query="abcdef123456") == "[bucket_id:abcdef123456]\nverbatim memory"
+    assert len(inspect.signature(server.breath).parameters) == 0
+    assert await server.breath_search(query="abcdef123456") == "[bucket_id:abcdef123456]\nverbatim memory"
     assert await server.trace(bucket_id="abcdef123456", delete=True) == "已移入回收站: abcdef123456"
     assert fake_embedding.deleted == ["abcdef123456"]
 
@@ -280,7 +528,7 @@ async def test_catalog_and_pre_split_grow_are_metadata_only_and_verbatim(tmp_pat
     monkeypatch.setattr(server, "bucket_mgr", FakeBuckets())
     monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
 
-    catalog = await server.breath(catalog=True, domain="WORK")
+    catalog = await server.breath_advanced(catalog=True, domain="WORK")
     assert "must not leak" not in catalog
     assert "hidden" not in catalog
     assert catalog.index("high | work | 9") < catalog.index("low | work | 2")
@@ -308,7 +556,7 @@ async def test_catalog_and_pre_split_grow_are_metadata_only_and_verbatim(tmp_pat
     too_many = await server.grow(items=["x"] * 101)
     assert "items 过多" in too_many
     assert len(calls) == call_count
-    assert "查询过大" in await server.breath(query="查" * 6000)
+    assert "查询过大" in await server.breath_search(query="查" * 6000)
 
 
 @pytest.mark.asyncio

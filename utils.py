@@ -16,8 +16,12 @@ import time
 import uuid
 import yaml
 import logging
+import asyncio
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from datetime import datetime, date, timezone
+from typing import Callable
 
 
 def _win_long_path(path: str | Path) -> str:
@@ -70,6 +74,120 @@ def atomic_write_text(path: str | Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+@asynccontextmanager
+async def filesystem_turn(base_dir: str | Path, key: str, timeout_seconds: float = 30.0):
+    """跨线程、跨事件循环、跨进程串行化同一资源的读改写。
+
+    FastMCP 的请求可能落在不同线程/事件循环，普通 asyncio.Lock 不足以保护
+    Markdown 文件。这里依靠 O_EXCL 原子创建锁文件，并回收超过一分钟的崩溃残留锁。
+    """
+    if not base_dir:
+        yield
+        return
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key))[:160] or "resource"
+    lock_dir = Path(base_dir) / ".locks"
+    os.makedirs(_win_long_path(lock_dir), exist_ok=True)
+    lock_path = lock_dir / f"{safe_key}.lock"
+    lock_long = _win_long_path(lock_path)
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    stale_seconds = max(600.0, timeout_seconds * 10)
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        try:
+            descriptor = os.open(lock_long, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_long).st_mtime > stale_seconds:
+                    os.unlink(lock_long)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {safe_key} lock")
+            await asyncio.sleep(0.01)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+                handle.flush()
+            break
+    try:
+        yield
+    finally:
+        try:
+            with open(lock_long, "r", encoding="utf-8") as handle:
+                owner = handle.read()
+            if owner == token:
+                os.unlink(lock_long)
+        except OSError:
+            pass
+
+
+_config_yaml_lock = threading.RLock()
+
+
+@contextmanager
+def _filesystem_turn_sync(base_dir: str | Path, key: str, timeout_seconds: float = 30.0):
+    """Synchronous companion used by ordinary request handlers and scripts."""
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key))[:160] or "resource"
+    lock_dir = Path(base_dir) / ".locks"
+    os.makedirs(_win_long_path(lock_dir), exist_ok=True)
+    lock_path = lock_dir / f"{safe_key}.lock"
+    lock_long = _win_long_path(lock_path)
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    stale_seconds = max(600.0, timeout_seconds * 10)
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        try:
+            descriptor = os.open(lock_long, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_long).st_mtime > stale_seconds:
+                    os.unlink(lock_long)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {safe_key} lock")
+            time.sleep(0.01)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+                handle.flush()
+            break
+    try:
+        yield
+    finally:
+        try:
+            with open(lock_long, "r", encoding="utf-8") as handle:
+                owner = handle.read()
+            if owner == token:
+                os.unlink(lock_long)
+        except OSError:
+            pass
+
+
+def atomic_update_config_yaml(
+    mutate: Callable[[dict], None], config_path: str | Path | None = None
+) -> dict:
+    """加锁读改写 config.yaml，原子替换后回读校验；失败必须如实抛出。"""
+    path = Path(config_path) if config_path else Path(__file__).resolve().with_name("config.yaml")
+    with _config_yaml_lock, _filesystem_turn_sync(path.parent, f"config-{path.name}"):
+        current: dict = {}
+        if os.path.exists(_win_long_path(path)):
+            with open(_win_long_path(path), "r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                current = loaded
+        mutate(current)
+        serialized = yaml.dump(current, default_flow_style=False, allow_unicode=True)
+        atomic_write_text(path, serialized)
+        with open(_win_long_path(path), "r", encoding="utf-8") as handle:
+            persisted = yaml.safe_load(handle) or {}
+        if persisted != current:
+            raise OSError("config.yaml verification failed after write")
+        return current
 
 
 def sideline_stale_dest(dest: str) -> None:

@@ -67,6 +67,7 @@ class EmbeddingOutbox:
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
         self._circuit_trips = 0
+        self._last_failure_bucket_id = ""
 
     @property
     def running(self) -> bool:
@@ -195,6 +196,7 @@ class EmbeddingOutbox:
     def retry_now(self) -> int:
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
+        self._last_failure_bucket_id = ""
         changed = 0
         with self._lock:
             for item in self._items.values():
@@ -340,6 +342,7 @@ class EmbeddingOutbox:
             self._persist_locked()
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
+        self._last_failure_bucket_id = ""
 
     def _fail(self, bucket_id: str, digest: str, error: Any) -> None:
         with self._lock:
@@ -356,14 +359,18 @@ class EmbeddingOutbox:
                 next_attempt_at=time.time() + delay,
             )
             self._persist_locked()
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self.circuit_failure_threshold:
-            exponent = min(self._consecutive_failures - self.circuit_failure_threshold, 16)
-            circuit_delay = min(self.circuit_max_seconds, self.circuit_base_seconds * (2 ** exponent))
-            was_open = self._circuit_delay() > 0
-            self._circuit_open_until = max(self._circuit_open_until, time.time() + circuit_delay)
-            if not was_open:
-                self._circuit_trips += 1
+        # 同一条内容反复失败通常是该内容触发供应商过滤，不代表供应商整体宕机；
+        # 只有不同桶接连失败才累计全局熔断，避免一条“毒内容”拖住所有新记忆。
+        if bucket_id != self._last_failure_bucket_id:
+            self._last_failure_bucket_id = bucket_id
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.circuit_failure_threshold:
+                exponent = min(self._consecutive_failures - self.circuit_failure_threshold, 16)
+                circuit_delay = min(self.circuit_max_seconds, self.circuit_base_seconds * (2 ** exponent))
+                was_open = self._circuit_delay() > 0
+                self._circuit_open_until = max(self._circuit_open_until, time.time() + circuit_delay)
+                if not was_open:
+                    self._circuit_trips += 1
         logger.warning("Embedding queued for retry: bucket=%s attempt=%s delay=%.1fs", bucket_id, attempts, delay)
 
     def _circuit_delay(self) -> float:
