@@ -4082,7 +4082,7 @@ def _serve_v2(rel_path: str):
         # 跨平台: Windows 上 abs_path 可能混用 \ 和 / (os.path.join + norm 里的 /),
         # 先统一成 / 再两头 strip, 否则 tail 会带前导 / 导致匹配失败 (本地 Windows 404)。
         tail = abs_path[len(console_base):].replace("\\", "/").strip("/")
-        if tail in ("breath", "config", "import", "trash"):
+        if tail in ("breath", "config", "import", "trash", "safety"):
             if not rel_path.endswith("/"):
                 return RedirectResponse(url="/v2/console/" + tail + "/", status_code=301)
             abs_path = os.path.join(console_base, "index.html")

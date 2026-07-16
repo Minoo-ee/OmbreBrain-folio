@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import frontmatter
@@ -629,3 +630,9 @@ async def test_embedding_outbox_is_durable_private_and_retries(tmp_path):
 
     assert await manager.delete(bucket_id) is True
     assert bucket_id in engine.deleted
+
+
+def test_console_safety_route_is_allowed_by_v2_router():
+    server_source = (Path(__file__).parents[1] / "server.py").read_text(encoding="utf-8")
+
+    assert '"breath", "config", "import", "trash", "safety"' in server_source
