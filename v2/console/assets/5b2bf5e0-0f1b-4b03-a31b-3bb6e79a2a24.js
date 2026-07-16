@@ -10,11 +10,13 @@ function routeFromUrl() {
   if (path.endsWith('/v2/console/config')) return 'config';
   if (path.endsWith('/v2/console/import')) return 'import';
   if (path.endsWith('/v2/console/trash')) return 'trash';
+  if (path.endsWith('/v2/console/safety')) return 'safety';
   const h = window.location.hash;
   if (h === '#breath') return 'breath';
   if (h === '#config') return 'config';
   if (h === '#import') return 'import';
   if (h === '#trash') return 'trash';
+  if (h === '#safety') return 'safety';
   return 'breath';
 }
 
@@ -110,6 +112,7 @@ function ConsoleApp() {
       {route === 'config' && <ConfigPage />}
       {route === 'import' && <ImportWorkbench />}
       {route === 'trash' && window.TrashPage && React.createElement(window.TrashPage, { onCountChange: setTrashCount })}
+      {route === 'safety' && window.SafetyPage && React.createElement(window.SafetyPage)}
 
       <TweaksPanel>
         <TweakSection label="控制台" />

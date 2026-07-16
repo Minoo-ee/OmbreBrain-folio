@@ -1,6 +1,6 @@
 """Safe, deterministic payload builder for Git backups.
 
-Only source-of-truth Markdown and a redacted runtime configuration are copied.
+Only source-of-truth Markdown, durable media, and a redacted runtime configuration are copied.
 Derived SQLite indexes/caches and plaintext credentials never enter backup history.
 """
 
@@ -79,7 +79,11 @@ def _copy_file_atomic(source: str | Path, destination: str | Path) -> None:
             pass
 
 
-def build_backup_payload(buckets_dir: str | os.PathLike, target_root: str | os.PathLike) -> dict:
+def build_backup_payload(
+    buckets_dir: str | os.PathLike,
+    target_root: str | os.PathLike,
+    media_dir: str | os.PathLike | None = None,
+) -> dict:
     """Build a redacted backup tree and return manifest metadata.
 
     The caller owns ``target_root`` (normally a temporary Git checkout). Existing
@@ -98,7 +102,8 @@ def build_backup_payload(buckets_dir: str | os.PathLike, target_root: str | os.P
 
     bucket_count = 0
     source_long = _win_long_path(source)
-    for root, _, files in os.walk(source_long):
+    for root, dirs, files in os.walk(source_long):
+        dirs[:] = [name for name in dirs if name not in ("_media", ".restore_backups", ".locks")]
         for filename in files:
             if not filename.endswith(".md"):
                 continue
@@ -106,6 +111,19 @@ def build_backup_payload(buckets_dir: str | os.PathLike, target_root: str | os.P
             relative = os.path.relpath(src, source_long)
             _copy_file_atomic(src, backup_dir / relative)
             bucket_count += 1
+
+    media_count = 0
+    media_source = Path(media_dir).resolve() if media_dir else source / "_media"
+    if media_source.is_dir():
+        media_source_long = _win_long_path(media_source)
+        for root, _, files in os.walk(media_source_long):
+            for filename in files:
+                src = os.path.join(root, filename)
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue
+                relative = os.path.relpath(src, media_source_long)
+                _copy_file_atomic(src, backup_dir / "_media" / relative)
+                media_count += 1
 
     runtime_path = source / "runtime_config.json"
     # Keep the historical filename so an existing tracked plaintext copy is
@@ -145,12 +163,14 @@ def build_backup_payload(buckets_dir: str | os.PathLike, target_root: str | os.P
         "version": 1,
         "hash": "sha256",
         "bucket_count": bucket_count,
+        "media_count": media_count,
         "files": payload_files,
     }
     manifest_path = target / "backup_manifest.json"
     atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return {
         "bucket_count": bucket_count,
+        "media_count": media_count,
         "file_count": len(payload_files),
         "manifest_sha256": _sha256(manifest_path),
     }

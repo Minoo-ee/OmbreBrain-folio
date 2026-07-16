@@ -21,6 +21,11 @@ log_level: "INFO"
 # 保持默认则使用内置的 ./buckets/ 目录
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
 
+# --- Persistent media / 持久附件 ---
+# 默认保存在 buckets_dir/_media；只有单独挂载媒体盘时才需要覆盖。
+# media_dir: "/path/to/persistent/media"
+media_max_bytes: 26214400  # 单个附件 25 MiB
+
 # --- External Markdown edits / 外部 Markdown 编辑 ---
 # Obsidian、Git 或手工改盘绕过服务写接口时，按 path/mtime/size 检查缓存。
 storage:

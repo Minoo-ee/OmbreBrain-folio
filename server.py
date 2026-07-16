@@ -37,6 +37,7 @@ import random
 import logging
 import asyncio
 import re
+import uuid
 import httpx
 
 
@@ -52,8 +53,10 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, atomic_update_config_yaml, coerce_bool
+from media_store import MediaPersistenceError
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, atomic_update_config_yaml, coerce_bool, filesystem_turn, _win_long_path
 from backup_utils import build_backup_payload
+from restore_utils import BackupRestoreError, apply_verified_restore, create_pre_restore_backup, inspect_backup_checkout, public_restore_report
 
 # 后台补账任务的强引用(防 GC 早收), 完成即自清
 _BG_TASKS: set = set()
@@ -306,6 +309,11 @@ async def _merge_or_create(
     name: str = "",
     event_time: str = None,
     raw_merge: bool = False,
+    media=None,
+    why_remembered: str = "",
+    meaning: str = "",
+    source_tool: str = "",
+    grow_batch_id: str = "",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -354,6 +362,14 @@ async def _merge_or_create(
                 # 没传就保持旧 event_time 不动
                 if event_time is not None:
                     update_kwargs["event_time"] = event_time
+                if media:
+                    update_kwargs["media_append"] = media
+                if why_remembered:
+                    update_kwargs["why_remembered"] = why_remembered
+                if meaning:
+                    update_kwargs["meaning_append"] = meaning
+                if source_tool:
+                    update_kwargs["last_merged_by"] = source_tool
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
@@ -368,6 +384,11 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
         event_time=event_time,
+        media=media,
+        why_remembered=why_remembered,
+        meaning=meaning,
+        source_tool=source_tool,
+        grow_batch_id=grow_batch_id,
     )
     return bucket_id, False
 
@@ -894,6 +915,9 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     event_time: str = "",
+    media=None,
+    why_remembered: str = "",
+    meaning: str = "",
 ) -> str:
     """存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
     await decay_engine.ensure_started()
@@ -932,6 +956,10 @@ async def hold(
             # 2026-06-10: feel 也接 event_time — 平时随手写 feel 当下即事发时间(不传=created, 行为不变),
             # 但批量回写历史(记忆写入工作台)时, 没有它 feel 的时间会全挤在写入批次那一刻
             event_time=event_time or None,
+            media=media,
+            why_remembered=why_remembered,
+            meaning=meaning,
+            source_tool="hold",
         )
         # --- Mark source memory as internalized + store model's valence perspective ---
         # --- 标记源记忆为已内化 + 存储模型视角的 valence ---
@@ -980,6 +1008,10 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
             event_time=event_time,
+            media=media,
+            why_remembered=why_remembered,
+            meaning=meaning,
+            source_tool="hold",
         )
         return f"📌钉选→{bucket_id} {','.join(str(d) for d in domain if d is not None)}"
 
@@ -993,6 +1025,10 @@ async def hold(
         arousal=arousal,
         name=suggested_name,
         event_time=event_time or None,
+        media=media,
+        why_remembered=why_remembered,
+        meaning=meaning,
+        source_tool="hold",
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -1007,6 +1043,7 @@ async def hold(
 async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。"""
     await decay_engine.ensure_started()
+    grow_batch_id = f"grow_{uuid.uuid4().hex[:16]}"
 
     # 上层模型已有完整对话上下文时，让它预先拆分通常比内部二次摘要更准确。
     # 每条只补元数据；正文逐字保存，合并时也仅追加，不交给 LLM 改写。
@@ -1057,6 +1094,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                     name=analysis.get("suggested_name", ""),
                     event_time=event_time or None,
                     raw_merge=True,
+                    source_tool="grow",
+                    grow_batch_id=grow_batch_id,
                 )
                 if is_merged:
                     results.append(f"📎{result_name}")
@@ -1092,6 +1131,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
             arousal=_emo_value(analysis, "arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
+            source_tool="grow",
+            grow_batch_id=grow_batch_id,
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(str(d) for d in (analysis.get('domain') or []) if d is not None)} V{_emo_value(analysis, 'valence', 0.5):.1f}/A{_emo_value(analysis, 'arousal', 0.3):.1f}"
@@ -1118,6 +1159,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
             arousal=_emo_value(analysis, "arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
+            source_tool="grow",
+            grow_batch_id=grow_batch_id,
         )
         return f"⚠ 自动拆分失败,已【整段存为一条】记忆(未拆分,内容没丢)→ {result_name}"
 
@@ -1144,6 +1187,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
                 event_time=event_time or None,
+                source_tool="grow",
+                grow_batch_id=grow_batch_id,
             )
 
             if is_merged:
@@ -1186,6 +1231,11 @@ async def trace(
     event_time: str = "",
     content: str = "",
     delete: bool = False,
+    media_append=None,
+    media_remove: str = "",
+    why_remembered: str = "",
+    meaning_append: str = "",
+    meaning_replace: list | None = None,
 ) -> str:
     """修改记忆元数据或内容。resolved=1归档(移入归档区→不再浮现、也不再被检索;可在 dashboard 归档区查看/恢复)/0取消归档标记,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
@@ -1258,6 +1308,16 @@ async def trace(
         updates["event_time"] = event_time
     if content:
         updates["content"] = content
+    if media_append:
+        updates["media_append"] = media_append
+    if media_remove:
+        updates["media_remove"] = media_remove
+    if why_remembered:
+        updates["why_remembered"] = why_remembered
+    if meaning_append:
+        updates["meaning_append"] = meaning_append
+    if meaning_replace is not None:
+        updates["meaning"] = meaning_replace
 
     if not updates:
         return "没有任何字段需要修改。"
@@ -2267,6 +2327,12 @@ async def api_buckets(request):
                 "activation_count": meta.get("activation_count", 1),
                 "score": decay_engine.calculate_score(meta),
                 "summary": meta.get("summary", ""),  # 用户编辑过的摘要(v2 modal),空则前端回退用 content_preview
+                "why_remembered": meta.get("why_remembered", ""),
+                "meaning": meta.get("meaning", []) or [],
+                "source_tool": meta.get("source_tool", ""),
+                "grow_batch_id": meta.get("grow_batch_id", ""),
+                "media": meta.get("media", []) or [],
+                "media_count": len(meta.get("media", []) or []),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
         result.sort(key=lambda x: x["score"], reverse=True)
@@ -2292,6 +2358,74 @@ async def api_bucket_detail(request):
         "content": strip_wikilinks(bucket.get("content", "")),
         "score": decay_engine.calculate_score(meta),
     })
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/media", methods=["POST"])
+async def api_bucket_media_upload(request):
+    """Persist a browser-uploaded attachment and append it to a bucket."""
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    if not await bucket_mgr.get(bucket_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict) or not (body.get("data_base64") or body.get("path")):
+        return JSONResponse({"error": "data_base64 or server-readable path is required"}, status_code=400)
+    try:
+        success = await bucket_mgr.update(bucket_id, media_append=[body])
+    except (MediaPersistenceError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if not success:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    _invalidate_buckets_cache()
+    fresh = await bucket_mgr.get(bucket_id)
+    media = (fresh or {}).get("metadata", {}).get("media", []) or []
+    return JSONResponse({"ok": True, "id": bucket_id, "media": media})
+
+
+@mcp.custom_route("/api/bucket/{bucket_id}/media/{media_index}", methods=["GET", "DELETE"])
+async def api_bucket_media_item(request):
+    """Serve or unlink one attachment by its bucket-local index."""
+    from starlette.responses import FileResponse, JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    try:
+        media_index = int(request.path_params["media_index"])
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "invalid media index"}, status_code=400)
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    media = bucket.get("metadata", {}).get("media", []) or []
+    if not isinstance(media, list) or media_index < 0 or media_index >= len(media):
+        return JSONResponse({"error": "media not found"}, status_code=404)
+    item = media[media_index]
+    reference = item.get("path") if isinstance(item, dict) else str(item)
+    if request.method == "DELETE":
+        success = await bucket_mgr.update(bucket_id, media_remove=reference)
+        if not success:
+            return JSONResponse({"error": "update failed"}, status_code=500)
+        _invalidate_buckets_cache()
+        fresh = await bucket_mgr.get(bucket_id)
+        return JSONResponse({
+            "ok": True,
+            "media": (fresh or {}).get("metadata", {}).get("media", []) or [],
+        })
+    try:
+        path = bucket_mgr.media_store.resolve_reference(reference)
+    except MediaPersistenceError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    title = item.get("title") if isinstance(item, dict) else None
+    filename = os.path.basename(str(title or path.name)).replace('"', "")
+    filename = re.sub(r"[\x00-\x1f\x7f]", "_", filename)[:200] or "attachment"
+    media_type = item.get("type") if isinstance(item, dict) else None
+    return FileResponse(
+        path=_win_long_path(path),
+        media_type=str(media_type or "application/octet-stream"),
+        filename=filename,
+        content_disposition_type="inline",
+    )
 
 
 # =============================================================
@@ -2324,6 +2458,8 @@ async def api_bucket_update(request):
         "summary",  # 用户可编辑的摘要(v2 modal),为空时回退到 content_preview
         "raw_source",  # 用户可手动补全/修订的原文片段(详情 modal 原文浮层编辑入口)
         "created_by",  # 来源分类 user/ai/import (历史 ai 桶可手动改成 import 等)
+        "media_append", "media_remove",
+        "why_remembered", "meaning", "meaning_append",
     }
     updates = {k: v for k, v in body.items() if k in allowed}
     if not updates:
@@ -2335,7 +2471,10 @@ async def api_bucket_update(request):
     if isinstance(updates.get("domain"), str):
         updates["domain"] = [d.strip() for d in updates["domain"].split(",") if d.strip()]
 
-    success = await bucket_mgr.update(bucket_id, **updates)
+    try:
+        success = await bucket_mgr.update(bucket_id, **updates)
+    except (MediaPersistenceError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     if not success:
         return JSONResponse({"error": "update failed"}, status_code=500)
     _invalidate_buckets_cache()
@@ -3202,6 +3341,9 @@ async def api_bucket_create(request):
     highlight = bool(body.get("highlight", False))
     internalized = bool(body.get("internalized", False))
     summary = body.get("summary") or None  # 用户在 WriteDrawer 填的"一句话摘要", 漏接 → 写一条记忆摘要永远存不下来
+    media = body.get("media")
+    why_remembered = body.get("why_remembered") or ""
+    meaning = body.get("meaning") or ""
     # type 字段 — 用户在 WriteDrawer 切 feel 时前端传 type='feel'
     # 默认 'dynamic', 合法值: dynamic / feel / permanent
     bucket_type = body.get("type", "dynamic")
@@ -3229,6 +3371,9 @@ async def api_bucket_create(request):
             bucket_type=bucket_type,  # feel 切换时这里写入 metadata.type='feel'
             created_by=created_by,  # 默认 'user' (dashboard 手动新建); 程序化写入可传 'ai'
             summary=summary,
+            media=media,
+            why_remembered=why_remembered,
+            meaning=meaning,
         )
     except Exception as e:
         return JSONResponse({"error": f"create failed: {e}"}, status_code=500)
@@ -3537,9 +3682,9 @@ async def api_backup(request):
             tmp = tempfile.mkdtemp(prefix="ombre-backup-")
             repo = porcelain.init(tmp)
 
-        # 2. 构建安全载荷：只复制 Markdown；runtime_config 脱敏后另存。
+        # 2. 构建安全载荷：复制 Markdown + 持久附件；runtime_config 脱敏后另存。
         # SQLite 派生索引、缓存、日志和明文凭据不进入 Git 历史。
-        payload = build_backup_payload(buckets_dir, tmp)
+        payload = build_backup_payload(buckets_dir, tmp, config.get("media_dir"))
         backup_subdir = os.path.join(tmp, "buckets")
 
         # 4. add 全部 (dulwich 需要相对路径)
@@ -3613,6 +3758,135 @@ async def api_backup(request):
         try:
             shutil.rmtree(tmp)
         except Exception:
+            pass
+
+
+@mcp.custom_route("/api/backup/status", methods=["GET"])
+async def api_backup_status(request):
+    """Return non-secret backup/restore readiness for the data-safety console."""
+    from starlette.responses import JSONResponse
+
+    buckets_dir = config.get("buckets_dir", "./buckets")
+    local_backups = []
+    backup_dir = os.path.join(buckets_dir, ".restore_backups")
+    try:
+        if os.path.isdir(backup_dir):
+            local_backups = sorted(
+                [name for name in os.listdir(backup_dir) if name.endswith(".zip")],
+                reverse=True,
+            )[:10]
+    except OSError:
+        local_backups = []
+    return JSONResponse({
+        "backup_configured": bool(
+            os.environ.get("OMBRE_BACKUP_REPO", "").strip()
+            and os.environ.get("OMBRE_BACKUP_TOKEN", "").strip()
+        ),
+        "admin_protected": bool(os.environ.get("OMBRE_ADMIN_TOKEN", "").strip()),
+        "restore_mode": "merge-only",
+        "local_safety_backups": local_backups,
+    })
+
+
+@mcp.custom_route("/api/backup/restore", methods=["POST"])
+async def api_backup_restore(request):
+    """Preview or apply a verified, merge-only restore from the configured Git repository.
+
+    ``commit=false`` only clones, verifies, and compares. ``commit=true`` additionally
+    requires ``confirm=RESTORE``, creates a local ZIP safety net, then atomically
+    overwrites same-path Markdown while preserving local-only files.
+    """
+    import hmac
+    import shutil
+    import tempfile
+    from starlette.responses import JSONResponse
+
+    expected = os.environ.get("OMBRE_ADMIN_TOKEN", "").strip()
+    if not expected:
+        return JSONResponse({"error": "OMBRE_ADMIN_TOKEN 未配置，拒绝开放恢复功能"}, status_code=503)
+    provided = request.headers.get("X-Admin-Token", "")
+    if not provided or not hmac.compare_digest(provided, expected):
+        return JSONResponse({"error": "invalid or missing admin token"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    commit_mode = coerce_bool(body.get("commit"), default=False)
+    if commit_mode and body.get("confirm") != "RESTORE":
+        return JSONResponse({"error": "恢复确认词不正确"}, status_code=400)
+
+    repo_url = os.environ.get("OMBRE_BACKUP_REPO", "").strip()
+    token = os.environ.get("OMBRE_BACKUP_TOKEN", "").strip()
+    branch = os.environ.get("OMBRE_BACKUP_BRANCH", "main").strip() or "main"
+    if not repo_url or not token:
+        return JSONResponse({"error": "OMBRE_BACKUP_REPO/TOKEN 未配置"}, status_code=503)
+    if not repo_url.startswith("https://"):
+        return JSONResponse({"error": "REPO 必须是 https:// URL"}, status_code=400)
+    auth_url = repo_url.replace("https://", f"https://x-access-token:{token}@", 1)
+    try:
+        from dulwich import porcelain
+    except ImportError as exc:
+        return JSONResponse({"error": f"dulwich 未安装: {exc}"}, status_code=500)
+
+    buckets_dir = config.get("buckets_dir", "./buckets")
+    tmp = tempfile.mkdtemp(prefix="ombre-restore-preview-")
+    try:
+        try:
+            with open(os.devnull, "wb") as errstream:
+                porcelain.clone(
+                    auth_url,
+                    tmp,
+                    depth=1,
+                    checkout=True,
+                    branch=branch.encode("utf-8"),
+                    errstream=errstream,
+                )
+        except Exception as exc:
+            safe_error = str(exc).replace(token, "***")
+            return JSONResponse({"error": f"读取 GitHub 备份失败: {safe_error}"}, status_code=502)
+
+        try:
+            report = await asyncio.to_thread(
+                inspect_backup_checkout, tmp, buckets_dir, config.get("media_dir")
+            )
+        except BackupRestoreError as exc:
+            return JSONResponse({"error": str(exc), "integrity_verified": False}, status_code=409)
+        preview = public_restore_report(report)
+        if not commit_mode:
+            return JSONResponse({"ok": True, "dry_run": True, **preview})
+
+        async with filesystem_turn(buckets_dir, "github-restore", timeout_seconds=60):
+            try:
+                safety_backup = await asyncio.to_thread(
+                    create_pre_restore_backup, buckets_dir, config.get("media_dir")
+                )
+                applied = await asyncio.to_thread(apply_verified_restore, report)
+            except Exception as exc:
+                return JSONResponse({
+                    "error": f"恢复失败: {exc}",
+                    "pre_restore_backup": locals().get("safety_backup", ""),
+                }, status_code=500)
+
+        bucket_mgr._invalidate_active_cache()
+        queued = 0
+        try:
+            queued = await embedding_outbox.reconcile(include_archive=True)
+            embedding_outbox.retry_now()
+        except Exception as exc:
+            logger.warning("Post-restore embedding reconciliation failed: %s", exc)
+        return JSONResponse({
+            "ok": True,
+            "dry_run": False,
+            **preview,
+            **applied,
+            "pre_restore_backup": safety_backup,
+            "embedding_jobs_queued": queued,
+            "message": "恢复完成；本地独有记忆未删除",
+        })
+    finally:
+        try:
+            shutil.rmtree(tmp)
+        except OSError:
             pass
 
 
@@ -4401,6 +4675,23 @@ if __name__ == "__main__":
                             scope["_mcp_url_key_ok"] = True
                 await self.app(scope, receive, send)
 
+        class NgrokHeaderMiddleware:
+            """Prevent ngrok's free-tier warning page from intercepting API/MCP traffic."""
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                async def send_with_header(message):
+                    if message.get("type") == "http.response.start":
+                        message = dict(message)
+                        headers = list(message.get("headers") or [])
+                        if not any(name.lower() == b"ngrok-skip-browser-warning" for name, _ in headers):
+                            headers.append((b"ngrok-skip-browser-warning", b"true"))
+                        message["headers"] = headers
+                    await send(message)
+
+                await self.app(scope, receive, send_with_header)
+
         # add_middleware 后加的在外层 → 先加 AuthGate (内层), 最后加 CORS (外层),
         # 让 CORS 先处理跨源预检 OPTIONS, 不会被 AuthGate 误拦。
         _app.add_middleware(AuthGate)
@@ -4423,6 +4714,7 @@ if __name__ == "__main__":
         )
         # 最后加 = 最外层: 先于一切看到原始 path, 校验/改写路径段密钥 (/<KEY>/mcp)。
         _app.add_middleware(McpUrlKeyPath)
+        _app.add_middleware(NgrokHeaderMiddleware)
         logger.info(
             "AuthGate + CORS + GZip middleware enabled / 已启用 鉴权 + CORS + GZip 中间件"
             f" (CORS origins={_allowed_origins or '同源 only'})"

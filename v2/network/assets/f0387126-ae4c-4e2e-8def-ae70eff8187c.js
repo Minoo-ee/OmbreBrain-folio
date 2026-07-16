@@ -313,8 +313,9 @@ function ConstellationApp() {
         <a href="/v2/network/" className="on">记忆星图</a>
         <a href="/v2/console/import/">导入</a>
         <a href="/v2/console/breath/">Breath 模拟</a>
-        <a href="/v2/console/config/">配置</a>
-        <a href="/v2/console/trash/">回收站</a>
+      <a href="/v2/console/config/">配置</a>
+      <a href="/v2/console/safety/">数据安全</a>
+      <a href="/v2/console/trash/">回收站</a>
       </nav>
 
       {/* 页头：标题 + 副标题 + 计数 + 操作 */}

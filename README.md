@@ -401,6 +401,8 @@ All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
 |---|---|---|
 | `transport` | `stdio`（本地）/ `streamable-http`（远程）| `stdio` |
 | `buckets_dir` | 记忆桶存储路径 / Bucket storage path | `./buckets/` |
+| `media_dir` | 持久附件目录 / Durable media path | `<buckets_dir>/_media` |
+| `media_max_bytes` | 单个附件上限 / Per-file limit | `26214400` (25 MiB) |
 | `dehydration.model` | 脱水用的 LLM 模型 / LLM model for dehydration | `deepseek-chat` |
 | `dehydration.base_url` | API 地址 / API endpoint | `https://api.deepseek.com/v1` |
 | `embedding.enabled` | 启用向量语义检索 / Enable embedding search | `true` |
@@ -414,6 +416,8 @@ Sensitive config via env vars:
 - `OMBRE_API_KEY` — LLM API 密钥
 - `OMBRE_TRANSPORT` — 覆盖传输方式
 - `OMBRE_BUCKETS_DIR` — 覆盖存储路径
+- `OMBRE_MEDIA_DIR` — 可选；附件使用独立持久盘时覆盖目录
+- `OMBRE_MEDIA_MAX_BYTES` — 可选；单个附件字节上限
 
 ## 衰减公式 / Decay Formula
 

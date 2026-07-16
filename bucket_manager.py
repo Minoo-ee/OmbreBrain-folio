@@ -44,12 +44,16 @@ import frontmatter
 import jieba
 from rapidfuzz import fuzz
 
+from media_store import MediaStore
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, is_highlighted, is_protected, is_internalized
 from utils import atomic_write_text as _atomic_write_text
 from utils import sideline_stale_dest as _sideline_stale_dest
 from utils import parse_iso_datetime, days_since_iso, coerce_bool, filesystem_turn
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+_MEANING_ITEM_MAX = 1000
+_MEANING_LIST_MAX_ITEMS = 20
 
 
 class BucketManager:
@@ -70,6 +74,15 @@ class BucketManager:
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
         self.trash_dir = os.path.join(self.base_dir, "trash")  # 软删除目录(回收站),可 restore
+        try:
+            media_max_bytes = int(config.get("media_max_bytes") or 25 * 1024 * 1024)
+        except (TypeError, ValueError):
+            media_max_bytes = 25 * 1024 * 1024
+        self.media_store = MediaStore(
+            self.base_dir,
+            str(config.get("media_dir") or os.path.join(self.base_dir, "_media")),
+            max_bytes=media_max_bytes,
+        )
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
         self.embedding_outbox = None
@@ -186,6 +199,25 @@ class BucketManager:
     def attach_embedding_outbox(self, outbox) -> None:
         """Attach the durable derived-index queue after both objects exist."""
         self.embedding_outbox = outbox
+
+    @staticmethod
+    def _normalize_meaning_item(value) -> str:
+        return str(value or "").strip()[:_MEANING_ITEM_MAX]
+
+    @classmethod
+    def _normalize_meaning_list(cls, values) -> list[str]:
+        if not values:
+            return []
+        if isinstance(values, str):
+            values = [values]
+        result = []
+        for value in values:
+            item = cls._normalize_meaning_item(value)
+            if item:
+                result.append(item)
+            if len(result) >= _MEANING_LIST_MAX_ITEMS:
+                break
+        return result
 
     def _queue_embedding(self, bucket_id: str, content: str) -> None:
         outbox = self.embedding_outbox
@@ -387,6 +419,8 @@ class BucketManager:
         meta = bucket.get("metadata", {}) or {}
         name = str(meta.get("name") or "")
         summary = str(meta.get("summary") or "")
+        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []))
+        why_remembered = str(meta.get("why_remembered") or "")
         content = str(bucket.get("content") or "")
         domain_str = " ".join(meta.get("domain") or [])
         tags_str = " ".join(meta.get("tags") or [])
@@ -396,6 +430,8 @@ class BucketManager:
             ("domain",  domain_str, 2.5),
             ("tag",     tags_str,   2.0),
             ("summary", summary,    1.5),
+            ("meaning", meaning,    1.0),
+            ("why",     why_remembered, 1.0),
             ("content", content,    self.content_weight),
         ]
 
@@ -704,6 +740,11 @@ class BucketManager:
         event_time: str = None,
         created_by: str = None,
         summary: str = None,
+        media=None,
+        why_remembered: str = "",
+        meaning: str = "",
+        source_tool: str = "",
+        grow_batch_id: str = "",
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -760,6 +801,18 @@ class BucketManager:
             metadata["highlight"] = True
         if summary:
             metadata["summary"] = str(summary)[:600]
+        if why_remembered:
+            metadata["why_remembered"] = str(why_remembered).strip()[:500]
+        meaning_item = self._normalize_meaning_item(meaning)
+        if meaning_item:
+            metadata["meaning"] = [meaning_item]
+        if source_tool:
+            metadata["source_tool"] = str(source_tool).strip()[:32]
+        if grow_batch_id:
+            metadata["grow_batch_id"] = str(grow_batch_id).strip()[:64]
+        persisted_media = await self.media_store.persist(bucket_id, media)
+        if persisted_media:
+            metadata["media"] = persisted_media
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -966,6 +1019,62 @@ class BucketManager:
             post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
         if "name" in kwargs:
             post["name"] = sanitize_name(kwargs["name"])
+        if "why_remembered" in kwargs:
+            why = str(kwargs["why_remembered"] or "").strip()[:500]
+            if why:
+                post["why_remembered"] = why
+            else:
+                _drop("why_remembered")
+        if "meaning" in kwargs:
+            meanings = self._normalize_meaning_list(kwargs["meaning"])
+            if meanings:
+                post["meaning"] = meanings
+            else:
+                _drop("meaning")
+        if "meaning_append" in kwargs:
+            addition = self._normalize_meaning_item(kwargs["meaning_append"])
+            existing_meanings = self._normalize_meaning_list(post.get("meaning") or [])
+            if addition:
+                if len(existing_meanings) >= _MEANING_LIST_MAX_ITEMS:
+                    raise ValueError(f"每条记忆最多保存 {_MEANING_LIST_MAX_ITEMS} 条 meaning。")
+                post["meaning"] = existing_meanings + [addition]
+        for provenance_key, limit in (("source_tool", 32), ("grow_batch_id", 64), ("last_merged_by", 32)):
+            if provenance_key in kwargs:
+                value = str(kwargs[provenance_key] or "").strip()[:limit]
+                if value:
+                    post[provenance_key] = value
+                else:
+                    _drop(provenance_key)
+        if "media_append" in kwargs:
+            additions = await self.media_store.persist(bucket_id, kwargs["media_append"])
+            existing = post.get("media") or []
+            if not isinstance(existing, list):
+                existing = [existing]
+            combined = []
+            seen_media = set()
+            for item in existing + additions:
+                normalized = item if isinstance(item, dict) else {"path": str(item)}
+                media_path = str(normalized.get("path") or "").strip()
+                if not media_path or media_path in seen_media:
+                    continue
+                seen_media.add(media_path)
+                combined.append(normalized)
+            if len(combined) > 20:
+                raise ValueError("每条记忆最多保存 20 个媒体附件。")
+            post["media"] = combined
+        if "media_remove" in kwargs:
+            remove_path = str(kwargs["media_remove"] or "").strip()
+            existing = post.get("media") or []
+            if not isinstance(existing, list):
+                existing = [existing]
+            kept = [
+                item for item in existing
+                if str((item.get("path") if isinstance(item, dict) else item) or "").strip() != remove_path
+            ]
+            if kept:
+                post["media"] = kept
+            else:
+                _drop("media")
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
             # 取消噪声: 若调用方没显式改 importance, 则从 importance_before_noise 恢复
@@ -1691,6 +1800,11 @@ class BucketManager:
         # 各字段独立 partial_ratio
         name_raw = fuzz.partial_ratio(query, meta.get("name", "") or "")
         summary_raw = fuzz.partial_ratio(query, meta.get("summary", "") or "")
+        meaning_raw = max(
+            (fuzz.partial_ratio(query, value) for value in self._normalize_meaning_list(meta.get("meaning") or [])),
+            default=0,
+        )
+        why_raw = fuzz.partial_ratio(query, meta.get("why_remembered", "") or "")
         domain_raw = max(
             (fuzz.partial_ratio(query, d) for d in meta.get("domain", []) if d),
             default=0,
@@ -1710,9 +1824,10 @@ class BucketManager:
         content_score = content_raw * self.content_weight
         # summary 走 bonus 通道,只加分子(权重 1.5),不进分母 → 不稀释其他字段命中
         summary_bonus = summary_raw * 1.5
+        experience_bonus = meaning_raw + why_raw
 
         weight_sum = 3 + 2.5 + 2 + self.content_weight  # 旧分母,保护已有阈值行为
-        score = (name_score + domain_score + tag_score + content_score + summary_bonus) / (100 * weight_sum)
+        score = (name_score + domain_score + tag_score + content_score + summary_bonus + experience_bonus) / (100 * weight_sum)
         # 上限 1.0(summary 命中拉高时可能超 1.0,但分子仍被 100*weight_sum 限制)
         if score > 1.0:
             score = 1.0
@@ -1721,6 +1836,8 @@ class BucketManager:
         matched_in = []
         if name_raw >= self._MATCH_THRESHOLD: matched_in.append("title")
         if summary_raw >= self._MATCH_THRESHOLD: matched_in.append("summary")
+        if meaning_raw >= self._MATCH_THRESHOLD: matched_in.append("meaning")
+        if why_raw >= self._MATCH_THRESHOLD: matched_in.append("why")
         if domain_raw >= self._MATCH_THRESHOLD: matched_in.append("domain")
         if tag_raw >= self._MATCH_THRESHOLD: matched_in.append("tag")
         if content_raw >= self._MATCH_THRESHOLD: matched_in.append("content")
@@ -1731,6 +1848,8 @@ class BucketManager:
             "field_scores": {
                 "title": name_raw,
                 "summary": summary_raw,
+                "meaning": meaning_raw,
+                "why": why_raw,
                 "domain": domain_raw,
                 "tag": tag_raw,
                 "content": content_raw,

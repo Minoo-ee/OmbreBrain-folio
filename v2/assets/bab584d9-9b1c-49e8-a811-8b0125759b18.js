@@ -48,6 +48,7 @@ function NavBarV2({ active = 'timeline' }) {
       <a href="/v2/console/import/">导入</a>
       <a href="/v2/console/breath/">Breath 模拟</a>
       <a href="/v2/console/config/">配置</a>
+      <a href="/v2/console/safety/">数据安全</a>
       <a href="/v2/console/trash/">回收站</a>
     </nav>
   );
@@ -229,6 +230,9 @@ function AppV2() {
         ...it,
         body: detail.content || '',
         summary: persistedSummary || it.summary || '',
+        why_remembered: (detail.metadata && detail.metadata.why_remembered) || it.why_remembered || '',
+        meaning: (detail.metadata && detail.metadata.meaning) || it.meaning || [],
+        artifacts: (detail.metadata && detail.metadata.media) || it.artifacts || [],
         _meta: detail.metadata,
         _bodyLoaded: true,
         _loading: false,

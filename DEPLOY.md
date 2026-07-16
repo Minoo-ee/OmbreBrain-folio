@@ -202,6 +202,11 @@ python server.py
 - 跑备份, 把私人 backup repo clone 到本地
 - 把 `buckets/` 拷出来作为本地 OMBRE_BUCKETS_DIR
 
+### 想从 GitHub 备份恢复?
+- 打开 `/v2/console/safety/`（控制台 → 数据安全）。
+- 先点“检查 GitHub 备份”：这一步只下载、校验哈希并预览新增/覆盖数量，不写本地文件。
+- 确认后再执行合并恢复。系统会先生成本地 ZIP 后悔药，只覆盖同路径文件，不删除本地独有记忆；持久附件也会一起校验和恢复。
+
 ### 切换 LLM 不想改 .env 重启?
 - 进 `/v2/console/config/` → API 配置 → 加多个 profile,一键切换不重启
 

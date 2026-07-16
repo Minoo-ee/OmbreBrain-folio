@@ -37,6 +37,8 @@
       time: time,
       title: b.name || b.id,
       summary: b.summary || '',           // 用户没填就空,跟其他视图一致
+      why_remembered: b.why_remembered || '',
+      meaning: Array.isArray(b.meaning) ? b.meaning : [],
       body: '',  // 列表 endpoint 不返回 content;打开详情时再 lazy-load
       importance: b.importance || 5,
       score: typeof b.score === 'number' ? b.score : 0,   // decay 分数
@@ -49,8 +51,10 @@
       highlight: !!b.highlight,
       internalized: !!(b.internalized || b.digested),
       created_by: b.created_by || '',
+      source_tool: b.source_tool || '',
+      grow_batch_id: b.grow_batch_id || '',
       domain: Array.isArray(b.domain) ? b.domain.filter(Boolean) : [],
-      artifacts: [],
+      artifacts: Array.isArray(b.media) ? b.media : [],
       _hasEventTime: hasEvent,
     };
   };
@@ -87,6 +91,8 @@
       event_time: eventTime,
     };
     if (entry.summary) body.summary = entry.summary;  // 后端 /api/bucket/create 读 summary
+    if (entry.why_remembered) body.why_remembered = entry.why_remembered;
+    if (entry.meaning) body.meaning = entry.meaning;
     if (entry.feel) {
       body.type = 'feel';     // 关键: 让后端 metadata.type='feel', 否则 isFeel() 永远 false
       body.valence = 0.6;
@@ -106,6 +112,8 @@
     var body = {};
     if (patch.title != null) body.name = patch.title;
     if (patch.body != null) body.content = patch.body;
+    if (patch.why_remembered != null) body.why_remembered = patch.why_remembered;
+    if (patch.meaning != null) body.meaning = patch.meaning;
     if (patch.raw_source != null) body.raw_source = patch.raw_source;  // 原文片段(用户手动补全)
     if (patch.created_by != null) body.created_by = patch.created_by;  // 来源 user/ai/import
     if (patch.importance != null) body.importance = patch.importance;

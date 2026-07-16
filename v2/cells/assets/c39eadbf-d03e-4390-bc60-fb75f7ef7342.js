@@ -18,6 +18,12 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
   const [savingRaw, setSavingRaw] = muS(false);
   // 自定义 tag 输入草稿 — 编辑态新增 tag 用 (allTagOptions 之外的)
   const [tagDraft, setTagDraft] = muS('');
+  const [mediaItems, setMediaItems] = muS(Array.isArray(item?.artifacts) ? item.artifacts : []);
+  const [mediaBusy, setMediaBusy] = muS(false);
+
+  muE(() => {
+    setMediaItems(Array.isArray(item?.artifacts) ? item.artifacts : []);
+  }, [item?.id, item?.artifacts]);
 
   // 切换条目时退出编辑 + 关原文 + 重置 draft
   muE(() => {
@@ -97,6 +103,7 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
     setDraft({
       title: item.title,
       summary: item.summary || '',
+      why_remembered: item.why_remembered || (item._meta && item._meta.why_remembered) || '',
       body: item.body || '',
       date: item.date || '',
       time: item.time || '',
@@ -123,6 +130,66 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
   const cancelEdit = () => {
     setEditing(false);
     setDraft(null);
+  };
+
+  const mediaUrl = (index) => `/api/bucket/${encodeURIComponent(item.id)}/media/${index}`;
+  const readAsDataUrl = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+  const uploadMedia = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (!files.length || mediaBusy) return;
+    if (mediaItems.length + files.length > 20) {
+      alert('每条记忆最多保存 20 个附件。');
+      return;
+    }
+    setMediaBusy(true);
+    try {
+      let latest = mediaItems;
+      for (const file of files) {
+        const response = await fetch(`/api/bucket/${encodeURIComponent(item.id)}/media`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            data_base64: await readAsDataUrl(file),
+            filename: file.name,
+            title: file.name,
+            type: file.type || 'application/octet-stream',
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        latest = data.media || latest;
+      }
+      setMediaItems(latest);
+      item.artifacts = latest;
+      if (item._meta) item._meta.media = latest;
+    } catch (e) {
+      alert('附件上传失败: ' + (e.message || String(e)));
+    } finally {
+      setMediaBusy(false);
+    }
+  };
+  const removeMedia = async (index) => {
+    if (mediaBusy || !window.confirm('从这条记忆移除该附件？持久文件会保留，避免误删。')) return;
+    setMediaBusy(true);
+    try {
+      const response = await fetch(mediaUrl(index), { method: 'DELETE' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const latest = data.media || [];
+      setMediaItems(latest);
+      item.artifacts = latest;
+      if (item._meta) item._meta.media = latest;
+    } catch (e) {
+      alert('移除附件失败: ' + (e.message || String(e)));
+    } finally {
+      setMediaBusy(false);
+    }
   };
 
   // 重新脱水: 走 RedehydrateModal 两阶段 (Phase1 选项 → Phase2 新旧对比 → 接受/重做)
@@ -251,6 +318,7 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
                 </>
               );
             })()}
+            {!editing && view.source_tool && <><span style={{ opacity: 0.5 }}>/</span><span style={{ opacity: 0.7 }} title={view.grow_batch_id || ''}>{view.source_tool === 'grow' ? 'grow 批次' : view.source_tool}</span></>}
             {!editing && view.protected && <><span style={{ opacity: 0.5 }}>/</span><span style={{ color: 'var(--c-pin)' }}>❖ 钉决</span></>}
             {!editing && view.highlight && !view.protected && <><span style={{ opacity: 0.5 }}>/</span><span style={{ color: 'var(--c-highlight)' }}>★ 高亮</span></>}
             {!editing && view.feel && <><span style={{ opacity: 0.5 }}>/</span><span style={{ color: 'var(--c-feel)' }}>♡ feel</span></>}
@@ -369,6 +437,30 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
               <div className="ob-modal-content">{view.body}</div>
             </>
           ))}
+
+          {editing ? (
+            <textarea
+              className="ob-modal-edit-summary"
+              value={draft.why_remembered}
+              onChange={(e) => setDraft(d => ({ ...d, why_remembered: e.target.value }))}
+              placeholder="为什么值得记住（可选，不参与打分）"
+              rows={2}
+            />
+          ) : view.why_remembered ? (
+            <>
+              <div className="ob-modal-section">为什么记得</div>
+              <div className="ob-modal-content">{view.why_remembered}</div>
+            </>
+          ) : null}
+
+          {!editing && Array.isArray(view.meaning) && view.meaning.length > 0 && (
+            <>
+              <div className="ob-modal-section">意义</div>
+              <div className="ob-modal-content">
+                {view.meaning.map((text, index) => <div key={index}>· {text}</div>)}
+              </div>
+            </>
+          )}
 
           <div className="ob-modal-section">标签</div>
           {editing ? (
@@ -500,16 +592,32 @@ function ItemModal({ item, allItems, onClose, onNavigate, onOpenItem, onUpdate }
             </>
           )}
 
-          {!editing && item.artifacts && item.artifacts.length > 0 && (
+          {!editing && (
             <>
-              <div className="ob-modal-section">附件 · {item.artifacts.length}</div>
+              <div className="ob-modal-section" style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                <span>附件 · {mediaItems.length}</span>
+                <label className="ob-modal-btn" style={{cursor:mediaBusy?'wait':'pointer',margin:0}}>
+                  {mediaBusy ? '处理中…' : '＋ 添加附件'}
+                  <input type="file" multiple disabled={mediaBusy} onChange={uploadMedia} style={{display:'none'}} />
+                </label>
+              </div>
               <div className="ob-modal-arts">
-                {item.artifacts.map(a => (
-                  <div key={a} className="ob-modal-art">
-                    <span className="ob-modal-art-i">▤</span>
-                    <span>{a}</span>
-                  </div>
-                ))}
+                {mediaItems.length === 0 && <div style={{fontSize:12,color:'var(--ink-4)'}}>图片和文件会复制进持久目录，并跟随备份。</div>}
+                {mediaItems.map((raw, index) => {
+                  const a = typeof raw === 'object' ? raw : { path: String(raw) };
+                  const title = a.title || String(a.path || '').split('/').pop() || `附件 ${index + 1}`;
+                  const isImage = String(a.type || '').startsWith('image/');
+                  return (
+                    <div key={(a.path || title) + index} className="ob-modal-art" style={{display:'flex',gap:10,alignItems:'center'}}>
+                      {isImage
+                        ? <img src={mediaUrl(index)} alt="" style={{width:52,height:52,objectFit:'cover',borderRadius:6}} />
+                        : <span className="ob-modal-art-i">▤</span>}
+                      <a href={mediaUrl(index)} target="_blank" rel="noreferrer" style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis'}}>{title}</a>
+                      <span style={{fontSize:11,color:'var(--ink-4)'}}>{a.size ? `${Math.max(1, Math.round(a.size / 1024))} KB` : ''}</span>
+                      <button type="button" className="ob-modal-btn" disabled={mediaBusy} onClick={() => removeMedia(index)}>移除</button>
+                    </div>
+                  );
+                })}
               </div>
             </>
           )}

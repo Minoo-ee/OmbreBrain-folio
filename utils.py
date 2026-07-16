@@ -76,6 +76,35 @@ def atomic_write_text(path: str | Path, text: str) -> None:
         raise
 
 
+def atomic_write_bytes(path: str | Path, data: bytes) -> None:
+    """Binary counterpart of ``atomic_write_text`` with Windows long-path support."""
+    path = Path(path)
+    os.makedirs(_win_long_path(path.parent), exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    temp_long = _win_long_path(temp_path)
+    target_long = _win_long_path(path)
+    try:
+        with open(temp_long, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(3):
+            try:
+                os.replace(temp_long, target_long)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        try:
+            if os.path.exists(temp_long):
+                os.remove(temp_long)
+        except OSError:
+            pass
+        raise
+
+
 @asynccontextmanager
 async def filesystem_turn(base_dir: str | Path, key: str, timeout_seconds: float = 30.0):
     """跨线程、跨事件循环、跨进程串行化同一资源的读改写。
@@ -330,6 +359,8 @@ def load_config(config_path: str = None) -> dict:
         "transport": "stdio",
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
+        "media_dir": "",
+        "media_max_bytes": 25 * 1024 * 1024,
         "merge_threshold": 75,
         "auto_merge": True,   # False = 关闭相似桶自动合并(永远新建); 默认 True = 上游行为不变
         "dehydration": {
@@ -416,6 +447,16 @@ def load_config(config_path: str = None) -> dict:
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
 
+    env_media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    if env_media_dir:
+        config["media_dir"] = env_media_dir
+    env_media_max = os.environ.get("OMBRE_MEDIA_MAX_BYTES", "").strip()
+    if env_media_max:
+        try:
+            config["media_max_bytes"] = max(1, int(env_media_max))
+        except ValueError:
+            logging.warning("Invalid OMBRE_MEDIA_MAX_BYTES=%r; using configured default", env_media_max)
+
     env_external_poll = os.environ.get("OMBRE_EXTERNAL_CHANGE_POLL_SECONDS", "").strip()
     if env_external_poll:
         try:
@@ -480,6 +521,12 @@ def load_config(config_path: str = None) -> dict:
             f"Set it to e.g. /opt/render/project/src/buckets (Render) "
             f"or /data (Docker)."
         )
+
+    media_dir = str(config.get("media_dir") or os.path.join(buckets_dir, "_media"))
+    if not os.path.isabs(media_dir):
+        media_dir = os.path.abspath(os.path.join(buckets_dir, media_dir))
+    config["media_dir"] = media_dir
+    os.makedirs(_win_long_path(media_dir), exist_ok=True)
 
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---

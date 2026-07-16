@@ -40,6 +40,7 @@ function ConsoleNav({ active, trashCount = 0 }) {
     { id: 'import',    label: '导入',       href: '/v2/console/import/' },
     { id: 'breath',    label: 'Breath 模拟', href: '/v2/console/breath/' },
     { id: 'config',    label: '配置',       href: '/v2/console/config/' },
+    { id: 'safety',    label: '数据安全',   href: '/v2/console/safety/' },
     { id: 'trash',     label: '回收站',     href: '/v2/console/trash/' },
   ];
   return (
