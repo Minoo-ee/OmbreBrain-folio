@@ -5136,7 +5136,7 @@ async def dashboard(request):
 # 静态托管 v2/ 目录(index.html + ombre-bridge.js + assets/*)。
 # /v2  → v2/index.html
 # /v2/<rel>  → v2/<rel>(限制在 v2/ 下,防穿越)
-def _serve_v2(rel_path: str):
+def _serve_v2(rel_path: str, request=None):
     from starlette.responses import Response, JSONResponse, RedirectResponse
     import os, mimetypes
     rel = (rel_path or "").lstrip("/")
@@ -5199,8 +5199,15 @@ def _serve_v2(rel_path: str):
     else:
         # index.html / ombre-bridge.js / theme-system.js / redehy-modal.{js,css} / manifest.json 等手改文件
         cache_header = "no-cache"
+    # ETag(mtime-size 弱验证): no-cache 文件回访时命中 If-None-Match 直接 304,
+    # 手机端不用每次重传 index.html / app.compiled.js / 大号桌面 index.html
+    st = os.stat(abs_path)
+    etag = f'W/"{int(st.st_mtime)}-{st.st_size}"'
+    resp_headers = {"Cache-Control": cache_header, "ETag": etag}
+    if request is not None and request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=resp_headers)
     with open(abs_path, "rb") as f:
-        return Response(f.read(), media_type=mime, headers={"Cache-Control": cache_header})
+        return Response(f.read(), media_type=mime, headers=resp_headers)
 
 
 # 手机 UA 嗅探: iPhone / iPod / Android 直接落到 /v2/mobile/,
@@ -5246,7 +5253,7 @@ async def v2_rel(request):
         qs = request.query_params
         if qs.get("desktop") != "1" and _is_mobile_ua(request.headers.get("user-agent", "")):
             return RedirectResponse(url="/v2/mobile/", status_code=302)
-    return _serve_v2(rel)
+    return _serve_v2(rel, request)
 
 
 @mcp.custom_route("/api/config", methods=["GET"])

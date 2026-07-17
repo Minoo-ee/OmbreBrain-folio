@@ -14,7 +14,9 @@
 <link rel="shortcut icon" href="/v2/favicon.ico" />
 <link rel="apple-touch-icon" href="/v2/favicon-180.png" />
 <link rel="manifest" href="/v2/manifest.json" />
-<title>Ombre Brain</title>
+<title>Ombre Brain (dev)</title>
+<!-- dev.html — 浏览器现场编译流程(Babel standalone), 改 app.jsx 刷新即生效, 调试用。
+     正式入口 index.html 用预编译产物, 调完跑 `node build.mjs` 同步过去。 -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Noto+Serif+SC:wght@400;500;600&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -22,11 +24,10 @@
 </head>
 <body>
   <div id="root"></div>
-  <!-- 预编译入口: 生产版 React(assets 下 UUID 命名吃一年 immutable 缓存) + build.mjs 产物。
-       改了 app.jsx / theme-system.js 必须跑 `node build.mjs` 并把下面 ?v= +1。
-       调试快路径(免 build 刷新即生效): ./dev.html -->
-  <script src="/v2/assets/05c8baa9-def0-4a12-ac12-42bf01033340.js"></script>
-  <script src="/v2/assets/d65a0f5e-8ee5-4f91-89d3-7be50ad9830c.js"></script>
-  <script src="./app.compiled.js?v=1"></script>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+  <script type="text/babel" src="../theme-system.js"></script>
+  <script type="text/babel" src="./app.jsx?v=10"></script>
 </body>
 </html>
