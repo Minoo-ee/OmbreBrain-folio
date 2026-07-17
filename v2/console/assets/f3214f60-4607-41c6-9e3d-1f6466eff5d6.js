@@ -4,12 +4,13 @@ const { useState: csS, useEffect: csE, useMemo: csM, useRef: csR } = React;
 
 // ── 顶栏 ──
 // search/setSearch 仅为兼容旧调用方保留, 顶栏不再渲染搜索框
-function ConsoleTopBar({ stats, dark, onDark }) {
+function ConsoleTopBar({ stats, dark, onDark, owner }) {
   return (
     <div className="ob-topbar">
       <div className="ob-brand">
         <span className="ob-brand-mark" />
         <span className="ob-brand-name">Ombre Brain</span>
+        {owner && owner.show_badge && <span style={{fontSize:10.5,padding:'3px 7px',borderRadius:8,background:'color-mix(in oklab, var(--accent) 12%, var(--paper))',color:'var(--accent)'}}>归属：{owner.name}</span>}
         <div className="ob-brand-stats">
           <span><b>{stats.total}</b> 格</span>
           <span><b>{stats.pinned}</b> 钉决</span>
@@ -39,8 +40,10 @@ function ConsoleNav({ active, trashCount = 0 }) {
     { id: 'star',      label: '记忆星图',   href: '/v2/network/' },
     { id: 'import',    label: '导入',       href: '/v2/console/import/' },
     { id: 'breath',    label: 'Breath 模拟', href: '/v2/console/breath/' },
+    { id: 'commitments', label: '关系与承诺', href: '/v2/console/commitments/' },
     { id: 'config',    label: '配置',       href: '/v2/console/config/' },
     { id: 'safety',    label: '数据安全',   href: '/v2/console/safety/' },
+    { id: 'operations', label: '部署连接',   href: '/v2/console/operations/' },
     { id: 'trash',     label: '回收站',     href: '/v2/console/trash/' },
   ];
   return (

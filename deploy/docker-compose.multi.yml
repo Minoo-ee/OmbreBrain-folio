@@ -1,0 +1,37 @@
+# 多 owner 示例：每人独立端口、数据卷和管理密钥。
+services:
+  ming:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports: ["127.0.0.1:18001:8000"]
+    environment:
+      OMBRE_TRANSPORT: streamable-http
+      OMBRE_OWNER_NAME: 小明
+      OMBRE_OWNER_COUNT: "2"
+      OMBRE_ADMIN_TOKEN: ${OMBRE_MING_ADMIN_TOKEN:?required}
+      OMBRE_MCP_URL_KEY: ${OMBRE_MING_MCP_URL_KEY:-}
+      OMBRE_API_KEY: ${OMBRE_API_KEY:-}
+      OMBRE_BASE_URL: ${OMBRE_BASE_URL:-}
+      OMBRE_MODEL: ${OMBRE_MODEL:-}
+    volumes:
+      - ${OMBRE_MING_BUCKETS_DIR:-./buckets-ming}:/app/buckets
+
+  hong:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports: ["127.0.0.1:18002:8000"]
+    environment:
+      OMBRE_TRANSPORT: streamable-http
+      OMBRE_OWNER_NAME: 小红
+      OMBRE_OWNER_COUNT: "2"
+      OMBRE_ADMIN_TOKEN: ${OMBRE_HONG_ADMIN_TOKEN:?required}
+      OMBRE_MCP_URL_KEY: ${OMBRE_HONG_MCP_URL_KEY:-}
+      OMBRE_API_KEY: ${OMBRE_API_KEY:-}
+      OMBRE_BASE_URL: ${OMBRE_BASE_URL:-}
+      OMBRE_MODEL: ${OMBRE_MODEL:-}
+    volumes:
+      - ${OMBRE_HONG_BUCKETS_DIR:-./buckets-hong}:/app/buckets

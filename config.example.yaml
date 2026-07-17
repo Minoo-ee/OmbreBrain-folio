@@ -86,7 +86,10 @@ decay:
 # 复用脱水配置的 API key 和 base_url
 embedding:
   enabled: true                   # Enable embedding / 启用向量化
+  api_format: "openai_compat"     # openai_compat / gemini / ollama(local)
   model: "gemini-embedding-001"   # Embedding model / 向量化模型
+  # base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  # 本地 Ollama: api_format=ollama, model=bge-m3；base_url 可留空自动探测本机/容器宿主
   # timeout_seconds: 30           # 请求超时秒数; env: OMBRE_EMBED_TIMEOUT_SECONDS
   background_indexing: true       # Markdown 先落盘,向量后台耐久重试;建议保持开启
   retry_base_seconds: 5           # 首次重试等待;之后指数退避
@@ -98,6 +101,8 @@ limits:
   max_grow_input_bytes: 2097152   # grow 整次输入 2 MB
   max_query_bytes: 16384          # breath 查询 16 KB
   max_grow_items: 100             # 单次预拆分条数
+  max_pinned: 20                  # 钉选/保护/核心高亮总量；0 = 不限制
+  max_high_importance: 24         # 普通 importance>=9 总量；满后新写入自动降为 8
 
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)

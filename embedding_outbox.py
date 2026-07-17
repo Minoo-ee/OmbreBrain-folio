@@ -109,6 +109,24 @@ class EmbeddingOutbox:
             self._persist_locked()
         return True
 
+    def ensure_pending(self, bucket_id: str, content: str) -> bool:
+        """Add repair work only when no newer pending version already exists."""
+        bucket_id = str(bucket_id or "").strip()
+        if not bucket_id or not (content or "").strip():
+            return False
+        now = now_iso()
+        with self._lock:
+            if bucket_id in self._items:
+                return True
+            self._items[bucket_id] = {
+                "content_hash": content_hash(content), "queued_at": now, "updated_at": now,
+                "attempts": 0, "next_attempt_at": 0.0, "last_attempt_at": "", "last_error": "",
+            }
+            self._persist_locked()
+        self._wake()
+        self.ensure_started()
+        return True
+
     def remove(self, bucket_id: str) -> None:
         """Forget pending work and delete the derived vector for a removed bucket."""
         self.discard(bucket_id)
@@ -209,7 +227,11 @@ class EmbeddingOutbox:
         return changed
 
     async def reconcile(self, *, include_archive: bool = True, buckets: list[dict] | None = None) -> int:
-        """Queue missing/hash-stale vectors and remove orphan derived rows."""
+        """Monotonically queue missing/hash-stale vectors.
+
+        Caller-provided bucket lists may be stale, so reconciliation never
+        removes or overwrites pending work. Managed delete paths call remove().
+        """
         if buckets is None:
             buckets = await self.bucket_mgr.list_all(include_archive=include_archive)
         current: dict[str, tuple[str, str]] = {}
@@ -221,32 +243,64 @@ class EmbeddingOutbox:
                 current[bucket_id] = (content, content_hash(content))
 
         engine = self.embedding_engine
-        indexed_ids = set(engine.list_all_ids()) if engine else set()
-        indexed_hashes = dict(engine.list_content_hashes()) if engine else {}
-        for orphan_id in indexed_ids - set(current):
+
+        def read_index_state():
+            if not engine:
+                return set(), {}, False
             try:
-                engine.delete_embedding(orphan_id)
+                reader = getattr(engine, "list_content_ids", None) or getattr(engine, "list_all_ids", None)
+                indexed_ids = set(reader()) if callable(reader) else set()
             except Exception as exc:
-                logger.warning("Could not remove orphan embedding %s: %s", orphan_id, exc)
+                logger.warning("Embedding reconciliation could not list IDs: %s", exc)
+                return None
+            hash_reader = getattr(engine, "list_content_hashes", None)
+            hashes_supported = callable(hash_reader)
+            try:
+                indexed_hashes = dict(hash_reader()) if hashes_supported else {}
+            except Exception as exc:
+                logger.warning("Embedding reconciliation could not list hashes: %s", exc)
+                indexed_hashes, hashes_supported = {}, False
+            return indexed_ids, indexed_hashes, hashes_supported
+
+        initial = read_index_state()
+        if initial is None:
+            return 0
+        indexed_ids, indexed_hashes, hashes_supported = initial
+        candidates = []
+        for bucket_id, (_content, digest) in current.items():
+            stored_hash = str(indexed_hashes.get(bucket_id) or "")
+            if bucket_id not in indexed_ids or (hashes_supported and stored_hash and stored_hash != digest):
+                candidates.append(bucket_id)
+
+        latest: dict[str, tuple[str, str]] = {}
+        for bucket_id in candidates:
+            try:
+                bucket = await self.bucket_mgr.get(bucket_id)
+            except Exception as exc:
+                logger.warning("Embedding reconciliation could not re-read %s: %s", bucket_id, exc)
+                continue
+            metadata = (bucket or {}).get("metadata") or {}
+            content = str((bucket or {}).get("content") or "")
+            if bucket and content.strip() and metadata.get("type") != "trashed" and not metadata.get("deleted_at"):
+                latest[bucket_id] = (content, content_hash(content))
 
         queued = 0
         changed = False
         now = now_iso()
         with self._lock:
-            for bucket_id in list(self._items):
-                if bucket_id not in current:
-                    self._items.pop(bucket_id, None)
-                    changed = True
-            for bucket_id, (_content, digest) in current.items():
+            final = read_index_state()
+            if final is None:
+                return 0
+            indexed_ids, indexed_hashes, hashes_supported = final
+            for bucket_id, (_content, digest) in latest.items():
                 stored_hash = str(indexed_hashes.get(bucket_id) or "")
-                needs_index = bucket_id not in indexed_ids or (stored_hash and stored_hash != digest)
+                needs_index = bucket_id not in indexed_ids or (
+                    hashes_supported and bool(stored_hash) and stored_hash != digest
+                )
                 existing = self._items.get(bucket_id)
                 if not needs_index:
-                    if existing is not None:
-                        self._items.pop(bucket_id, None)
-                        changed = True
                     continue
-                if existing and existing.get("content_hash") == digest:
+                if existing is not None:
                     continue
                 self._items[bucket_id] = {
                     "content_hash": digest,

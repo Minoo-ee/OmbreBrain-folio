@@ -2977,6 +2977,26 @@ function SettingScreen() {
           </div>
         </div>
 
+        <div className="setting-section-hd">关系 / 承诺</div>
+        <div className="setting-list">
+          <div className="setting-row" onClick={() => { window.location.href = '/v2/console/commitments/'; }}>
+            <div className="setting-row-ic">◇</div>
+            <div className="setting-row-mid">
+              <div className="setting-row-title">计划、信件与 Anchor</div>
+              <div className="setting-row-sub">管理承诺、自我认知和不主动浮现的记忆</div>
+            </div>
+            <span className="setting-row-arrow">›</span>
+          </div>
+          <div className="setting-row" onClick={() => { window.location.href = '/v2/console/operations/'; }}>
+            <div className="setting-row-ic">⌁</div>
+            <div className="setting-row-mid">
+              <div className="setting-row-title">部署与连接</div>
+              <div className="setting-row-sub">OAuth / Tunnel / 更新与运行自检</div>
+            </div>
+            <span className="setting-row-arrow">›</span>
+          </div>
+        </div>
+
         <div className="setting-section-hd">数据</div>
         <div className="setting-list">
           <div className="setting-row" onClick={() => navigate('/setting/import')}>

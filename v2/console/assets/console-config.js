@@ -119,6 +119,8 @@ function ConfigPage() {
   const [switching, setSwitching] = ccS(null);
   const [showKey, setShowKey] = ccS(false);
   const [appliedAt, setAppliedAt] = ccS('');
+  const [embeddingDraft, setEmbeddingDraft] = ccS(null);
+  const [embeddingSaving, setEmbeddingSaving] = ccS(false);
 
   // 策略参数(merge_threshold / max_recall)
   const [strategy, setStrategy] = ccS({ merge_threshold: 75, max_recall: 5 });
@@ -169,7 +171,23 @@ function ConfigPage() {
       }
     } catch (e) { /* 沉默 */ }
   };
-  ccE(() => { fetchAll(); fetchStrategy(); fetchDecay(); fetchPrompts(); }, []);
+  const fetchEmbedding = async () => {
+    try {
+      const r = await fetch('/api/config');
+      if (r.ok) setEmbeddingDraft((await r.json()).embedding || null);
+    } catch (e) { /* 沉默 */ }
+  };
+  const saveEmbedding = async () => {
+    setEmbeddingSaving(true);
+    try {
+      const r = await fetch('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({embedding:embeddingDraft,persist:true})});
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      await fetchEmbedding(); setAppliedAt('刚刚');
+    } catch(e) { alert('Embedding 保存失败: ' + e.message); }
+    finally { setEmbeddingSaving(false); }
+  };
+  ccE(() => { fetchAll(); fetchStrategy(); fetchDecay(); fetchPrompts(); fetchEmbedding(); }, []);
 
   // ─── Prompt 编辑相关 ───
   const isPromptOverridden = (key) => promptCfg && promptCfg.overridden && promptCfg.overridden.includes(key);
@@ -258,7 +276,7 @@ function ConfigPage() {
       const d = await r.json();
       if (d.state) setPromptCfg(d.state);
       setPromptDraft({});
-      alert(`已切换到 2026-04-19 上游基线 ${(d.aligned || []).length} 个 prompt` +
+      alert(`已切换到上游 v2.7.6 基线 ${(d.aligned || []).length} 个 prompt` +
         (d.skipped && d.skipped.length ? ` · 跳过 ${d.skipped.length} 个独创 prompt` : ''));
     } catch (e) {
       alert('对齐失败: ' + e.message);
@@ -632,25 +650,26 @@ function ConfigPage() {
 
       {/* 向量化 Embedding */}
       <ConsoleCard label="向量化 Embedding" sub="为每条记忆生成稠密向量,用于语义检索与相似聚合。">
+        {!embeddingDraft ? <div style={{fontSize:12,color:'var(--ink-3)'}}>载入中…</div> : <>
         <div className="oc-field">
           <div className="oc-field-label">启用</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div className="oc-switch on" />
-            <span style={{ fontSize: 12, color: 'var(--ink-3)', fontFamily: 'var(--mono)' }}>已开启 · 新写入会自动 embed</span>
-          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 12 }}><input type="checkbox" checked={!!embeddingDraft.enabled} onChange={e=>setEmbeddingDraft({...embeddingDraft,enabled:e.target.checked})}/>{embeddingDraft.enabled?'新写入会自动 embed':'已停用'}</label>
+        </div>
+        <div className="oc-field">
+          <div className="oc-field-label">后端格式</div>
+          <select className="oc-input oc-input-mono" value={embeddingDraft.api_format||'openai_compat'} onChange={e=>{const local=e.target.value==='ollama';setEmbeddingDraft({...embeddingDraft,api_format:e.target.value,model:local&&String(embeddingDraft.model||'').includes('gemini')?'bge-m3':embeddingDraft.model,base_url:local&&String(embeddingDraft.base_url||'').startsWith('https://')?'':embeddingDraft.base_url});}}><option value="openai_compat">云端 OpenAI 兼容</option><option value="gemini">Gemini</option><option value="ollama">本地 Ollama</option></select>
         </div>
         <div className="oc-field">
           <div className="oc-field-label">MODEL</div>
-          <input className="oc-input oc-input-mono" value="gemini-embedding-001" disabled />
+          <input className="oc-input oc-input-mono" value={embeddingDraft.model||''} placeholder={embeddingDraft.api_format==='ollama'?'bge-m3':'gemini-embedding-001'} onChange={e=>setEmbeddingDraft({...embeddingDraft,model:e.target.value})}/>
         </div>
         <div className="oc-field">
-          <div className="oc-field-label">维度</div>
-          <input className="oc-input oc-input-mono" type="number" value={768} disabled />
+          <div className="oc-field-label">BASE URL</div>
+          <input className="oc-input oc-input-mono" value={embeddingDraft.base_url||''} placeholder={embeddingDraft.api_format==='ollama'?'留空自动使用本机 Ollama':'https://.../v1'} onChange={e=>setEmbeddingDraft({...embeddingDraft,base_url:e.target.value})}/>
         </div>
-        <div className="oc-field">
-          <div className="oc-field-label">批量大小</div>
-          <input className="oc-input oc-input-mono" type="number" value={32} disabled />
-        </div>
+        <div className="oc-field"><div className="oc-field-label">超时（秒）</div><input className="oc-input oc-input-mono" type="number" min="1" max="300" value={embeddingDraft.timeout_seconds||30} onChange={e=>setEmbeddingDraft({...embeddingDraft,timeout_seconds:Number(e.target.value)})}/></div>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:10,marginTop:10}}><span style={{fontSize:11,color:embeddingDraft.provider_ready?'#4A7C59':'var(--ink-4)'}}>{embeddingDraft.provider_ready?'运行后端已就绪':'后端未就绪或未配置 Key'}</span><button className="oc-btn oc-btn-primary" disabled={embeddingSaving} onClick={saveEmbedding}>{embeddingSaving?'保存中…':'保存并热切换'}</button></div>
+        </>}
       </ConsoleCard>
 
       {/* ═══ 配置页策略面板 (Claude Design 改版 · 方案 β「权重双栏」, 2026-06-09) ═══ */}
@@ -695,7 +714,7 @@ function ConfigPage() {
                 disabled={promptResetAllBusy}
                 style={{ fontSize: 11, padding: '3px 12px' }}
                 title="把上游 (P0luz/Ombre-Brain) 有的 prompt 全部切到上游版本"
-              >{promptResetAllBusy ? '⌛' : '⇆ 2026-04-19 上游基线'}</button>
+              >{promptResetAllBusy ? '⌛' : '⇆ 上游 v2.7.6 基线'}</button>
               <button
                 className="oc-btn oc-btn-ghost"
                 onClick={resetPromptAll}

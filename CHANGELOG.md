@@ -2,6 +2,15 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-07-17 · 上游 v2.7.6 产品能力完整对齐
+
+- 新增独立 Plan / Letter / `I` 记忆类型、计划自动完成判断、Anchor（24 条上限）、`dont_surface`、`first_of_kind`、`triggered_by` 与桌面/手机响应式管理入口。
+- 新增 OAuth 2.1 PKCE MCP 鉴权、Cloudflare Quick Tunnel 控制、部署自检、安全暂存式自更新/重启与受来源约束的测试数据硬删除；危险动作均默认关闭。
+- 新增多人多实例启动器和 Docker 模板：每位 owner 使用独立进程、端口、数据目录和 Secret，子进程不继承其他 owner 的 Secret。
+- 新增钉选与普通高重要度的跨进程并发配额；对齐 Embedding 单调补账、本地 Ollama 安全切换和脱水视角 v4，避免旧快照覆盖新任务及人物主语翻转。
+- 反代头只接受 `OMBRE_TRUSTED_PROXY_CIDRS` 白名单最后一跳；OAuth 公网 origin 必须显式固定，访问/刷新令牌仅以哈希落盘。
+- 新增傻子版扩展能力说明与 7 组专项回归；全仓结果为 `115 passed, 7 skipped, 5 subtests passed`。
+
 ## 2026-07-16 · 数据恢复、持久附件与体验元数据
 
 - 新增 GitHub 备份只读校验与合并恢复：正式恢复前自动生成本地 ZIP，不删除本地独有记忆，并支持 Windows 深路径。

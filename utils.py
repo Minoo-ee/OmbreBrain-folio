@@ -391,7 +391,7 @@ def load_config(config_path: str = None) -> dict:
     # --- Load user config from YAML file ---
     # --- 从 YAML 文件加载用户自定义配置 ---
     if config_path is None:
-        config_path = os.path.join(
+        config_path = os.environ.get("OMBRE_CONFIG_PATH", "").strip() or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "config.yaml"
         )
 

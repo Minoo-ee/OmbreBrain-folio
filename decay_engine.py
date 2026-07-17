@@ -246,7 +246,7 @@ class DecayEngine:
             # Skip permanent / feel / protected buckets
             # 跳过固化桶、feel 桶(心动时刻防遗忘)、保护桶(防衰减)。
             # highlight 单独不防衰减,仍参与衰减/归档,只是浮现时被推到核心准则区。
-            if meta.get("type") in ("permanent", "feel") or is_protected(meta):
+            if meta.get("type") in ("permanent", "feel", "plan", "letter", "i") or is_protected(meta):
                 continue
 
             checked += 1

@@ -11,12 +11,16 @@ function routeFromUrl() {
   if (path.endsWith('/v2/console/import')) return 'import';
   if (path.endsWith('/v2/console/trash')) return 'trash';
   if (path.endsWith('/v2/console/safety')) return 'safety';
+  if (path.endsWith('/v2/console/commitments')) return 'commitments';
+  if (path.endsWith('/v2/console/operations')) return 'operations';
   const h = window.location.hash;
   if (h === '#breath') return 'breath';
   if (h === '#config') return 'config';
   if (h === '#import') return 'import';
   if (h === '#trash') return 'trash';
   if (h === '#safety') return 'safety';
+  if (h === '#commitments') return 'commitments';
+  if (h === '#operations') return 'operations';
   return 'breath';
 }
 
@@ -29,6 +33,7 @@ function ConsoleApp() {
   const [data, setData] = cAS([]);
   const [loading, setLoading] = cAS(true);
   const [loadError, setLoadError] = cAS(null);
+  const [owner, setOwner] = cAS(null);
 
   cAE(() => {
     const sync = () => {
@@ -67,6 +72,9 @@ function ConsoleApp() {
     } catch (e) { /* 沉默 */ }
   };
   cAE(() => { refreshTrashCount(); }, []);
+  cAE(() => {
+    fetch('/api/system/status?light=1').then(r => r.ok ? r.json() : null).then(d => setOwner(d && d.owner)).catch(() => {});
+  }, []);
 
   // 拉真实数据
   const refresh = async () => {
@@ -94,6 +102,7 @@ function ConsoleApp() {
         onDark={setDark}
         search={search}
         setSearch={setSearch}
+        owner={owner}
       />
       <ConsoleNav active={route} trashCount={trashCount} />
 
@@ -113,6 +122,8 @@ function ConsoleApp() {
       {route === 'import' && <ImportWorkbench />}
       {route === 'trash' && window.TrashPage && React.createElement(window.TrashPage, { onCountChange: setTrashCount })}
       {route === 'safety' && window.SafetyPage && React.createElement(window.SafetyPage)}
+      {route === 'commitments' && window.CommitmentsPage && React.createElement(window.CommitmentsPage, { items: data })}
+      {route === 'operations' && window.OperationsPage && React.createElement(window.OperationsPage)}
 
       <TweaksPanel>
         <TweakSection label="控制台" />

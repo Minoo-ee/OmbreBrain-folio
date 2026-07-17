@@ -18,6 +18,7 @@ import hashlib
 import sqlite3
 import logging
 import asyncio
+from urllib.parse import urlparse
 from collections import OrderedDict
 from pathlib import Path
 
@@ -43,13 +44,34 @@ class EmbeddingEngine:
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
 
+        self.api_format = str(
+            os.environ.get("OMBRE_EMBED_FORMAT") or embed_cfg.get("api_format") or "openai_compat"
+        ).strip().lower()
+        is_local = self.api_format in {"ollama", "local"}
+
         # 优先用 embedding 独立的 api_key / base_url(env: OMBRE_EMBED_API_KEY / OMBRE_EMBED_BASE_URL),
         # 没配就 fallback 到 dehydration 的(常见情况:同一家 Gemini key 跑 dehydration + embedding)。
         # 重要:dehydration 用 deepseek/openrouter 等其他家时,这里必须独立配 Gemini key,
         # 否则用别家的 key 调 gemini-embedding-001 会一直 401/404 静默失败。
-        self.api_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
-        self.base_url = embed_cfg.get("base_url") or dehy_cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai/"
-        self.model = embed_cfg.get("model", "gemini-embedding-001")
+        cloud_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
+        configured_base = str(embed_cfg.get("base_url") or "").strip()
+        configured_model = str(embed_cfg.get("model") or "").strip()
+        if is_local:
+            # Never forward a retained cloud secret to a local/user-supplied
+            # Ollama endpoint. AsyncOpenAI requires a non-empty placeholder.
+            self.api_key = "ollama"
+            local_default = "http://host.docker.internal:11434/v1" if os.path.exists("/.dockerenv") else "http://127.0.0.1:11434/v1"
+            local_env = os.environ.get("OMBRE_OLLAMA_URL", "").strip()
+            host = (urlparse(configured_base).hostname or "").lower()
+            configured_is_cloud = configured_base.startswith("https://") or any(
+                marker in host for marker in ("googleapis.com", "siliconflow", "openai.com", "dashscope")
+            )
+            self.base_url = local_env or ("" if configured_is_cloud else configured_base) or local_default
+            self.model = configured_model if configured_model and "gemini" not in configured_model.lower() else "bge-m3"
+        else:
+            self.api_key = cloud_key
+            self.base_url = configured_base or dehy_cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai/"
+            self.model = configured_model or "gemini-embedding-001"
         # coerce_bool: YAML 里写成带引号的 "false" 也不误开(对齐上游 2.5.3)
         self.enabled = bool(self.api_key) and coerce_bool(embed_cfg.get("enabled"), default=True)
         # embedding 请求超时可配(对齐上游 2.4.5):
@@ -216,6 +238,16 @@ class EmbeddingEngine:
         rows = conn.execute("SELECT bucket_id, model FROM embeddings").fetchall()
         conn.close()
         return [bucket_id for bucket_id, model in rows if self._model_matches(model)]
+
+    def list_content_ids(self) -> list[str]:
+        """Return current-model rows that contain a real content vector."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model, embedding FROM embeddings").fetchall()
+        conn.close()
+        return [
+            bucket_id for bucket_id, model, embedding in rows
+            if self._model_matches(model) and str(embedding or "").strip() not in {"", "[]"}
+        ]
 
     def list_content_hashes(self) -> dict[str, str]:
         """Return exact-content identities for current-model vectors."""

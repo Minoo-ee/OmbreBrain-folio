@@ -11,7 +11,7 @@ A long-term emotional memory system for AI assistants. Tags memories using Russe
 >
 > **如果你不需要这些前端/便利功能，请直接支持[原作者的版本](https://github.com/P0luz/Ombre-Brain)。**
 >
-> 📋 [CHANGES.md](./CHANGES.md) 改了什么 · 🚀 [DEPLOY.md](./DEPLOY.md) 云部署+备份 · 🔄 [MIGRATION.md](./MIGRATION.md) 从上游迁移
+> 📋 [CHANGES.md](./CHANGES.md) 改了什么 · 🚀 [DEPLOY.md](./DEPLOY.md) 云部署+备份 · 🧭 [扩展能力傻子版说明](./docs/OPTIONAL_FEATURES.md) · 🔄 [MIGRATION.md](./MIGRATION.md) 从上游迁移
 >
 > 💡 第一次接触 Ombre-Brain？记忆模型 / 衰减 / 做梦这些**核心概念建议先读[原作者的 README](https://github.com/P0luz/Ombre-Brain)**，讲得很完整；本仓的概念说明沿用其设计。
 
