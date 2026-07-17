@@ -1138,6 +1138,21 @@ function MemFullScreen({ id }) {
 
   const m = data.metadata || {};
   const dt = bucketDate({ event_time: m.event_time, created: m.created, last_active: m.last_active });
+  // 删除后回这条记忆所在的"当日"视图(批量整理工作流: 删完接着挑下一条), 没日期才兜底回 home
+  const afterDelete = () => navigate(dt ? '/day/' + dayKeyOf(dt) : '/');
+  const del = async () => {
+    if (!window.confirm('删除「' + (m.name || data.id) + '」?\n移到回收站,可在设置 → 回收站恢复。')) return;
+    try {
+      const r = await fetch('/api/bucket/' + encodeURIComponent(data.id) + '/delete', { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      afterDelete();
+    } catch (e) {
+      window.alert('删除失败: ' + (e.message || e));
+    }
+  };
   const dayFmt = dt ? fmtDay(dt) : null;
   const time = dt ? fmtTime(dt) : '';
   const tags = (m.tags || []).filter(t => !String(t).startsWith('__')); // 隐藏 __* 内部 tag
@@ -1226,6 +1241,7 @@ function MemFullScreen({ id }) {
       </div>
 
       <div className="mem-full-action">
+        <button className="mem-full-fab danger" onClick={del} title="删除" style={{ cursor: 'pointer' }}>✕</button>
         <button className="mem-full-fab" onClick={() => setEditing(true)} title="编辑" style={{ cursor: 'pointer' }}>✎</button>
       </div>
 
@@ -1234,6 +1250,7 @@ function MemFullScreen({ id }) {
           bucketId={data.id}
           onClose={() => setEditing(false)}
           onSaved={() => setRefreshKey(k => k + 1)}
+          onDeleted={afterDelete}
         />
       )}
 
@@ -1842,9 +1859,9 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
       if (onDeleted) {
         onDeleted(bucketId);
       } else {
-        // 没传 onDeleted (MemFull 等单条详情页) → 显式回 home, 不依赖 history 栈.
-        // PWA 冷启动直接进 /mem 时 history 没"上一页", back() 行为不稳;
-        // 显式 navigate 保证一定回到列表 + 触发 scroll 恢复, 让连续删除工作流可用.
+        // 没传 onDeleted 的兜底 → 显式回 home, 不依赖 history 栈
+        // (PWA 冷启动直接进 /mem 时 history 没"上一页", back() 行为不稳)。
+        // MemFull 传了 onDeleted=回当日视图, Review 传了自己的列表刷新。
         navigate('/');
       }
     } catch (e) {
