@@ -52,8 +52,8 @@ def test_config(tmp_path):
         },
         "embedding": {
             "api_key": os.environ.get("OMBRE_API_KEY", ""),
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-            "model": "gemini-embedding-001",
+            "base_url": "https://api.siliconflow.cn/v1",
+            "model": "BAAI/bge-m3",
         },
     }
 
