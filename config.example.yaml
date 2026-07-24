@@ -76,7 +76,7 @@ decay:
 # 复用脱水配置的 API key 和 base_url
 embedding:
   enabled: true                   # Enable embedding / 启用向量化
-  model: "gemini-embedding-001"   # Embedding model / 向量化模型
+  model: "BAAI/bge-m3"   # Embedding model / 向量化模型
   # timeout_seconds: 30           # 请求超时秒数; env: OMBRE_EMBED_TIMEOUT_SECONDS
 
 # --- Scoring weights / 检索权重参数 ---
