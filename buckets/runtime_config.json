@@ -1,0 +1,15 @@
+{
+  "active": null,
+  "profiles": {},
+  "strategy": {
+    "merge_threshold": 99,
+    "auto_merge": false
+  },
+  "scoring": {
+    "keyword_first_sort": true,
+    "precise_match_mode": true,
+    "title_hit_bonus": 23.0,
+    "warmth_boost": 1.5,
+    "content_weight": 1.5
+  }
+}
