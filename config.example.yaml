@@ -25,7 +25,7 @@ log_level: "INFO"
 # When storing a new memory, if similarity with an existing bucket exceeds
 # this value (0-100), merge instead of creating a new one
 # 存新记忆时，如果与已有桶的相似度超过此值（0-100），则合并而非新建
-merge_threshold: 75
+merge_threshold: 99
 
 # --- Dehydration API / 脱水压缩 API 配置 ---
 # Uses a cheap LLM for intelligent compression; auto-degrades to local
